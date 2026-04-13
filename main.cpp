@@ -1,7 +1,7 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
-#include <iostream>
+#include <cstdio>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <memory>
@@ -77,13 +77,13 @@ public:
         beast::get_lowest_layer(ws_).expires_never();
 
         co_await ws_.async_handshake(host, "/ws", net::use_awaitable);
-        std::cout << "Connected to Go Backend at " << host << ":" << port << std::endl;
+        printf("Connected to Go Backend at %s:%s\n", host.c_str(), port.c_str());
     }
 
     net::awaitable<void> send(std::string message) {
-        std::cout << "Sending to Go backend: " << message << std::endl;
+        printf("Sending to Go backend: %s\n", message.c_str());
         co_await ws_.async_write(net::buffer(message), net::use_awaitable);
-        std::cout << "Message sent to Go backend" << std::endl;
+        printf("Message sent to Go backend\n");
     }
 
     net::awaitable<std::string> receive() {
@@ -128,11 +128,11 @@ net::awaitable<void> remote_reader(
     try {
         for (;;) {
             std::string message = co_await remote->receive();
-            std::cout << "Received from Go backend, broadcasting to local sessions" << std::endl;
+            printf("Received from Go backend, broadcasting to local sessions\n");
             co_await session_manager->broadcast(message);
         }
     } catch (std::exception& e) {
-        std::cerr << "Remote reader error: " << e.what() << std::endl;
+        fprintf(stderr, "Remote reader error: %s\n", e.what());
     }
 }
 
@@ -144,7 +144,7 @@ net::awaitable<void> listener(
     auto executor = co_await net::this_coro::executor;
     tcp::acceptor acceptor(executor, {tcp::v4(), port});
     
-    std::cout << "dltxt_bridge (Coroutine mode) on port " << port << std::endl;
+    printf("dltxt_bridge (Coroutine mode) on port %u\n", port);
 
     for (;;) {
         tcp::socket socket = co_await acceptor.async_accept(net::use_awaitable);
@@ -176,7 +176,7 @@ int main() {
                     // Start the loops that depend on that connection
                     co_await remote_reader(remote_client_ptr, session_manager);
                 } catch (std::exception& e) {
-                    std::cerr << "Startup or Connection Error: " << e.what() << std::endl;
+                    fprintf(stderr, "Startup or Connection Error: %s\n", e.what());
                 }
             }
             
@@ -185,7 +185,7 @@ int main() {
 
         ioc.run();
     } catch (std::exception& e) {
-        std::cerr << "Bridge Error: " << e.what() << std::endl;
+        fprintf(stderr, "Bridge Error: %s\n", e.what());
         return 1;
     }
     return 0;
