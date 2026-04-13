@@ -1,0 +1,9 @@
+{
+  "name": "dltxt-bridge",
+  "version": "0.1.0",
+  "dependencies": [
+    "boost-asio",
+    "boost-beast",
+    "nlohmann-json"
+  ]
+}
