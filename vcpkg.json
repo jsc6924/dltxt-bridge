@@ -4,6 +4,7 @@
   "dependencies": [
     "boost-asio",
     "boost-beast",
-    "nlohmann-json"
+    "nlohmann-json",
+    "openssl"
   ]
 }
