@@ -261,6 +261,7 @@ net::awaitable<void> remote_reader(
         }
     } catch (std::exception& e) {
         fprintf(stderr, "Remote reader error: %s\n", e.what());
+        throw;
     }
 }
 // Coroutine to listen for new VS Code windows
@@ -302,11 +303,18 @@ int main() {
                     return std::make_shared<RemoteClient>(executor);
                 },
                 [session_manager, response_manager](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
-                    // WAIT for the connection to be fully established
-                    co_await remote_client_ptr->connect("127.0.0.1", "9000");
+                    try {
+                        // WAIT for the connection to be fully established
+                        co_await remote_client_ptr->connect("127.0.0.1", "9000");
 
-                    // Start the loops that depend on that connection
-                    co_await remote_reader(remote_client_ptr, session_manager, response_manager);
+                        // Start the loops that depend on that connection
+                        co_await remote_reader(remote_client_ptr, session_manager, response_manager);
+                    } catch (...) {
+                        response_manager->cancel_all();
+                        throw;
+                    }
+
+                    response_manager->cancel_all();
                 },
                 [](std::exception_ptr error) {
                     try {

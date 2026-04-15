@@ -21,6 +21,8 @@ using json = nlohmann::json;
 using RequestId = std::variant<std::monostate, std::int64_t, std::string>;
 
 namespace lsp {
+inline constexpr std::size_t max_content_length = 10U * 1024U * 1024U;
+
 inline std::string frame_message(const std::string& payload) {
     return "Content-Length: " + std::to_string(payload.size()) + "\r\n\r\n" + payload;
 }
@@ -49,7 +51,12 @@ inline std::optional<std::size_t> parse_content_length(const std::string& header
             value.erase(0, first);
 
             try {
-                return static_cast<std::size_t>(std::stoull(value));
+                const auto parsed = static_cast<std::size_t>(std::stoull(value));
+                if (parsed > max_content_length) {
+                    return std::nullopt;
+                }
+
+                return parsed;
             } catch (...) {
                 return std::nullopt;
             }
@@ -185,6 +192,14 @@ public:
         if (it != pending_responses_.end()) {
             it->second->responses.push_back(response);
             it->second->signal->cancel();
+        }
+    }
+
+    void cancel_all() {
+        for (auto& [id, tracker] : pending_responses_) {
+            if (tracker && tracker->signal) {
+                tracker->signal->cancel();
+            }
         }
     }
 

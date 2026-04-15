@@ -1,6 +1,7 @@
 #include <boost/asio.hpp>
 
 #include <cassert>
+#include <chrono>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -37,6 +38,13 @@ void test_parse_content_length_case_insensitive() {
 
 void test_parse_content_length_missing() {
     const auto parsed = lsp::parse_content_length("Content-Type: text/plain\r\n\r\n");
+    assert(!parsed.has_value());
+}
+
+void test_parse_content_length_too_large() {
+    const std::string headers = "Content-Length: " + std::to_string(lsp::max_content_length + 1) + "\r\n\r\n";
+    const auto parsed = lsp::parse_content_length(headers);
+
     assert(!parsed.has_value());
 }
 
@@ -112,6 +120,30 @@ void test_response_manager_integer_id_round_trip() {
     assert((*result)["id"] == 17);
 }
 
+void test_response_manager_cancel_all_releases_waiters() {
+    net::io_context ioc;
+    auto manager = std::make_shared<ResponseManager>();
+    const RequestId id = std::string{"req-cancel"};
+    manager->create_request_tracker(id, ioc.get_executor());
+
+    std::optional<json> result;
+
+    net::co_spawn(ioc,
+        [manager, &result, id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(id);
+            co_return;
+        },
+        net::detached);
+
+    net::post(ioc, [manager]() {
+        manager->cancel_all();
+    });
+
+    ioc.run();
+
+    assert(!result.has_value());
+}
+
 struct FakeRemote {
     int id = -1;
 };
@@ -168,6 +200,90 @@ void test_remote_retry_loop_retries_with_fresh_remote_instances() {
     assert(error_count == 1);
     assert(!active_remote->get());
 }
+
+void test_remote_retry_loop_cancels_pending_responses_after_disconnect() {
+    net::io_context ioc;
+    auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
+    auto response_manager = std::make_shared<ResponseManager>();
+    const RequestId id = std::string{"req-disconnect"};
+
+    std::optional<json> result;
+    int error_count = 0;
+
+    response_manager->create_request_tracker(id, ioc.get_executor());
+
+    net::co_spawn(ioc,
+        [response_manager, &result, id]() -> net::awaitable<void> {
+            result = co_await response_manager->wait_for_response(id);
+            co_return;
+        },
+        net::detached);
+
+    net::co_spawn(ioc,
+        run_remote_retry_loop(
+            active_remote,
+            [](boost::asio::any_io_executor) {
+                return std::make_shared<FakeRemote>();
+            },
+            [response_manager](const std::shared_ptr<FakeRemote>&) -> net::awaitable<void> {
+                response_manager->cancel_all();
+                throw std::runtime_error("disconnect");
+            },
+            [&error_count](std::exception_ptr error) {
+                ++error_count;
+
+                try {
+                    if (error) {
+                        std::rethrow_exception(error);
+                    }
+                } catch (const std::runtime_error& e) {
+                    assert(std::string(e.what()) == "disconnect");
+                } catch (...) {
+                    assert(false);
+                }
+            },
+            1),
+        net::detached);
+
+    ioc.run();
+
+    assert(error_count == 1);
+    assert(!result.has_value());
+    assert(!active_remote->get());
+}
+
+void test_remote_retry_loop_applies_backoff_after_failure() {
+    using namespace std::chrono_literals;
+
+    net::io_context ioc;
+    auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
+    std::vector<std::chrono::steady_clock::time_point> attempt_times;
+
+    net::co_spawn(ioc,
+        run_remote_retry_loop(
+            active_remote,
+            [](boost::asio::any_io_executor) {
+                return std::make_shared<FakeRemote>();
+            },
+            [&attempt_times](const std::shared_ptr<FakeRemote>&) -> net::awaitable<void> {
+                attempt_times.push_back(std::chrono::steady_clock::now());
+                if (attempt_times.size() == 1) {
+                    throw std::runtime_error("disconnect");
+                }
+
+                co_return;
+            },
+            [](std::exception_ptr) {},
+            2,
+            20ms,
+            40ms),
+        net::detached);
+
+    ioc.run();
+
+    assert(attempt_times.size() == 2);
+    assert((attempt_times[1] - attempt_times[0]) >= 15ms);
+}
 }
 
 int main() {
@@ -175,9 +291,13 @@ int main() {
     test_parse_content_length_with_crlf();
     test_parse_content_length_case_insensitive();
     test_parse_content_length_missing();
+    test_parse_content_length_too_large();
     test_jsonrpc_helpers();
     test_response_manager_round_trip();
     test_response_manager_integer_id_round_trip();
+    test_response_manager_cancel_all_releases_waiters();
     test_remote_retry_loop_retries_with_fresh_remote_instances();
+    test_remote_retry_loop_cancels_pending_responses_after_disconnect();
+    test_remote_retry_loop_applies_backoff_after_failure();
     return 0;
 }
