@@ -155,17 +155,19 @@ net::awaitable<void> handle_local_session(
                     continue;
                 }
 
-                RequestId id = *maybe_id;
+                RequestId original_id = *maybe_id;
+                json original_id_json = request["id"];
                 auto executor = co_await net::this_coro::executor;
-                response_manager->create_request_tracker(id, executor, request_timeout);
+                RequestId bridge_id = response_manager->create_request_tracker(original_id, executor, request_timeout);
+                request["id"] = jsonrpc::request_id_to_json(bridge_id);
 
                 // RAII Guard: Automatically calls cleanup(id) when this object goes out of scope
-                ResponseCleanup guard{response_manager, id};
+                ResponseCleanup guard{response_manager, bridge_id};
 
                 // Forward request to Go
                 co_await remote->send(request.dump());
 
-                auto wait_result = co_await response_manager->wait_for_response(id);
+                auto wait_result = co_await response_manager->wait_for_response(bridge_id);
 
                 if (wait_result.status == ResponseManager::WaitStatus::response_ready && wait_result.response.has_value()) {
                     std::string out = lsp::frame_message(wait_result.response->dump());
@@ -175,7 +177,7 @@ net::awaitable<void> handle_local_session(
                         net::use_awaitable
                     );
                 } else if (wait_result.status == ResponseManager::WaitStatus::timed_out) {
-                    json error_resp = jsonrpc::create_error(request["id"], -32001, "Request timed out");
+                    json error_resp = jsonrpc::create_error(original_id_json, -32001, "Request timed out");
                     std::string framed = lsp::frame_message(error_resp.dump());
                     co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
                 }
@@ -257,6 +259,7 @@ int main(int argc, char* argv[]) {
     try {
         const BridgeSettings settings = parse_bridge_settings(argc, argv);
         net::io_context ioc;
+        auto stop_signals = install_stop_signals(ioc);
 
         auto remote_registry = std::make_shared<RemoteRegistry>();
         auto session_manager = std::make_shared<LocalSessionManager>();

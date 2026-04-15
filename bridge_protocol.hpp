@@ -159,10 +159,12 @@ inline json create_notification(const std::string& method, const json& params = 
 class ResponseManager {
 private:
     struct Tracker {
+        RequestId original_id;
         std::deque<json> responses;
         std::unique_ptr<net::steady_timer> signal;
     };
     std::map<RequestId, std::shared_ptr<Tracker>> pending_responses_;
+    std::uint64_t next_bridge_request_id_ = 0;
 
 public:
     enum class WaitStatus {
@@ -176,15 +178,17 @@ public:
         std::optional<json> response;
     };
 
-    std::shared_ptr<Tracker> create_request_tracker(
-        const RequestId& id,
+    RequestId create_request_tracker(
+        const RequestId& original_id,
         net::any_io_executor ex,
         std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
 
+        RequestId bridge_id = std::string{"bridge-" + std::to_string(++next_bridge_request_id_)};
         auto tracker = std::make_shared<Tracker>();
+        tracker->original_id = original_id;
         tracker->signal = std::make_unique<net::steady_timer>(ex, timeout);
-        pending_responses_[id] = tracker;
-        return tracker;
+        pending_responses_[bridge_id] = tracker;
+        return bridge_id;
     }
 
     net::awaitable<WaitResult> wait_for_response(const RequestId& id) {
@@ -197,6 +201,7 @@ public:
             if (!tracker->responses.empty()) {
                 json response = std::move(tracker->responses.front());
                 tracker->responses.pop_front();
+                response["id"] = jsonrpc::request_id_to_json(tracker->original_id);
                 co_return WaitResult{WaitStatus::response_ready, std::move(response)};
             }
 

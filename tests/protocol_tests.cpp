@@ -84,6 +84,13 @@ void test_parse_bridge_settings_rejects_invalid_port() {
     assert(threw);
 }
 
+void test_bridge_signal_numbers_include_shutdown_signals() {
+    const auto signals = bridge_signal_numbers();
+
+    assert(std::find(signals.begin(), signals.end(), SIGINT) != signals.end());
+    assert(std::find(signals.begin(), signals.end(), SIGTERM) != signals.end());
+}
+
 void test_socket_helpers_identify_and_prune_dead_sockets() {
     net::io_context ioc;
 
@@ -127,20 +134,20 @@ void test_jsonrpc_helpers() {
 void test_response_manager_round_trip() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
-    const RequestId id = std::string{"req-1"};
-    manager->create_request_tracker(id, ioc.get_executor());
+    const RequestId original_id = std::string{"req-1"};
+    const RequestId bridge_id = manager->create_request_tracker(original_id, ioc.get_executor());
 
     std::optional<ResponseManager::WaitResult> result;
 
     net::co_spawn(ioc,
-        [manager, &result, id]() -> net::awaitable<void> {
-            result = co_await manager->wait_for_response(id);
+        [manager, &result, bridge_id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(bridge_id);
             co_return;
         },
         net::detached);
 
-    net::post(ioc, [manager, id]() {
-        manager->store_response(id, json{{"jsonrpc", "2.0"}, {"id", jsonrpc::request_id_to_json(id)}, {"result", json{{"ok", true}}}});
+    net::post(ioc, [manager, bridge_id]() {
+        manager->store_response(bridge_id, json{{"jsonrpc", "2.0"}, {"id", jsonrpc::request_id_to_json(bridge_id)}, {"result", json{{"ok", true}}}});
     });
 
     ioc.run();
@@ -148,26 +155,27 @@ void test_response_manager_round_trip() {
     assert(result.has_value());
     assert(result->status == ResponseManager::WaitStatus::response_ready);
     assert(result->response.has_value());
+    assert((*result->response)["id"] == "req-1");
     assert((*result->response)["result"]["ok"] == true);
 }
 
 void test_response_manager_integer_id_round_trip() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
-    const RequestId id = std::int64_t{17};
-    manager->create_request_tracker(id, ioc.get_executor());
+    const RequestId original_id = std::int64_t{17};
+    const RequestId bridge_id = manager->create_request_tracker(original_id, ioc.get_executor());
 
     std::optional<ResponseManager::WaitResult> result;
 
     net::co_spawn(ioc,
-        [manager, &result, id]() -> net::awaitable<void> {
-            result = co_await manager->wait_for_response(id);
+        [manager, &result, bridge_id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(bridge_id);
             co_return;
         },
         net::detached);
 
-    net::post(ioc, [manager, id]() {
-        manager->store_response(id, json{{"jsonrpc", "2.0"}, {"id", 17}, {"result", json{{"ok", true}}}});
+    net::post(ioc, [manager, bridge_id]() {
+        manager->store_response(bridge_id, json{{"jsonrpc", "2.0"}, {"id", jsonrpc::request_id_to_json(bridge_id)}, {"result", json{{"ok", true}}}});
     });
 
     ioc.run();
@@ -178,17 +186,65 @@ void test_response_manager_integer_id_round_trip() {
     assert((*result->response)["id"] == 17);
 }
 
+void test_response_manager_allows_duplicate_original_ids() {
+    net::io_context ioc;
+    auto manager = std::make_shared<ResponseManager>();
+    const RequestId original_id = std::int64_t{42};
+    const RequestId bridge_id_a = manager->create_request_tracker(original_id, ioc.get_executor());
+    const RequestId bridge_id_b = manager->create_request_tracker(original_id, ioc.get_executor());
+
+    assert(bridge_id_a != bridge_id_b);
+
+    std::optional<ResponseManager::WaitResult> result_a;
+    std::optional<ResponseManager::WaitResult> result_b;
+
+    net::co_spawn(ioc,
+        [manager, &result_a, bridge_id_a]() -> net::awaitable<void> {
+            result_a = co_await manager->wait_for_response(bridge_id_a);
+            co_return;
+        },
+        net::detached);
+
+    net::co_spawn(ioc,
+        [manager, &result_b, bridge_id_b]() -> net::awaitable<void> {
+            result_b = co_await manager->wait_for_response(bridge_id_b);
+            co_return;
+        },
+        net::detached);
+
+    net::post(ioc, [manager, bridge_id_b]() {
+        manager->store_response(bridge_id_b, json{{"jsonrpc", "2.0"}, {"id", jsonrpc::request_id_to_json(bridge_id_b)}, {"result", json{{"which", "b"}}}});
+    });
+
+    net::post(ioc, [manager, bridge_id_a]() {
+        manager->store_response(bridge_id_a, json{{"jsonrpc", "2.0"}, {"id", jsonrpc::request_id_to_json(bridge_id_a)}, {"result", json{{"which", "a"}}}});
+    });
+
+    ioc.run();
+
+    assert(result_a.has_value());
+    assert(result_b.has_value());
+    assert(result_a->status == ResponseManager::WaitStatus::response_ready);
+    assert(result_b->status == ResponseManager::WaitStatus::response_ready);
+    assert(result_a->response.has_value());
+    assert(result_b->response.has_value());
+    assert((*result_a->response)["id"] == 42);
+    assert((*result_b->response)["id"] == 42);
+    assert((*result_a->response)["result"]["which"] == "a");
+    assert((*result_b->response)["result"]["which"] == "b");
+}
+
 void test_response_manager_cancel_all_releases_waiters() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId id = std::string{"req-cancel"};
-    manager->create_request_tracker(id, ioc.get_executor());
+    const RequestId bridge_id = manager->create_request_tracker(id, ioc.get_executor());
 
     std::optional<ResponseManager::WaitResult> result;
 
     net::co_spawn(ioc,
-        [manager, &result, id]() -> net::awaitable<void> {
-            result = co_await manager->wait_for_response(id);
+        [manager, &result, bridge_id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(bridge_id);
             co_return;
         },
         net::detached);
@@ -210,13 +266,13 @@ void test_response_manager_times_out_waiters() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId id = std::string{"req-timeout"};
-    manager->create_request_tracker(id, ioc.get_executor(), 20ms);
+    const RequestId bridge_id = manager->create_request_tracker(id, ioc.get_executor(), 20ms);
 
     std::optional<ResponseManager::WaitResult> result;
 
     net::co_spawn(ioc,
-        [manager, &result, id]() -> net::awaitable<void> {
-            result = co_await manager->wait_for_response(id);
+        [manager, &result, bridge_id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(bridge_id);
             co_return;
         },
         net::detached);
@@ -294,11 +350,11 @@ void test_remote_retry_loop_cancels_pending_responses_after_disconnect() {
     std::optional<ResponseManager::WaitResult> result;
     int error_count = 0;
 
-    response_manager->create_request_tracker(id, ioc.get_executor());
+    const RequestId bridge_id = response_manager->create_request_tracker(id, ioc.get_executor());
 
     net::co_spawn(ioc,
-        [response_manager, &result, id]() -> net::awaitable<void> {
-            result = co_await response_manager->wait_for_response(id);
+        [response_manager, &result, bridge_id]() -> net::awaitable<void> {
+            result = co_await response_manager->wait_for_response(bridge_id);
             co_return;
         },
         net::detached);
@@ -380,10 +436,12 @@ int main() {
     test_parse_bridge_settings_defaults();
     test_parse_bridge_settings_overrides();
     test_parse_bridge_settings_rejects_invalid_port();
+    test_bridge_signal_numbers_include_shutdown_signals();
     test_socket_helpers_identify_and_prune_dead_sockets();
     test_jsonrpc_helpers();
     test_response_manager_round_trip();
     test_response_manager_integer_id_round_trip();
+    test_response_manager_allows_duplicate_original_ids();
     test_response_manager_cancel_all_releases_waiters();
     test_response_manager_times_out_waiters();
     test_remote_retry_loop_retries_with_fresh_remote_instances();

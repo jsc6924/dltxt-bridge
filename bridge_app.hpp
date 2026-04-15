@@ -3,6 +3,7 @@
 #include <boost/asio.hpp>
 
 #include <algorithm>
+#include <csignal>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -20,6 +21,27 @@ struct BridgeSettings {
     std::string remote_port = "9000";
     std::chrono::milliseconds request_timeout = std::chrono::seconds(30);
 };
+
+inline std::vector<int> bridge_signal_numbers() {
+    std::vector<int> signals{SIGINT, SIGTERM};
+#ifdef SIGBREAK
+    signals.push_back(SIGBREAK);
+#endif
+    return signals;
+}
+
+inline std::unique_ptr<net::signal_set> install_stop_signals(net::io_context& ioc) {
+    auto signals = std::make_unique<net::signal_set>(ioc);
+    for (int signal_number : bridge_signal_numbers()) {
+        signals->add(signal_number);
+    }
+
+    signals->async_wait([&ioc](const boost::system::error_code&, int) {
+        ioc.stop();
+    });
+
+    return signals;
+}
 
 inline bool socket_is_dead(const std::shared_ptr<tcp::socket>& socket) {
     return !socket || !socket->is_open();
