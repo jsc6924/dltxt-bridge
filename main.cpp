@@ -180,6 +180,10 @@ net::awaitable<void> handle_local_session(
                     json error_resp = jsonrpc::create_error(original_id_json, -32001, "Request timed out");
                     std::string framed = lsp::frame_message(error_resp.dump());
                     co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                } else if (wait_result.status == ResponseManager::WaitStatus::cancelled) {
+                    json error_resp = jsonrpc::create_error(original_id_json, -32002, "Remote server disconnected while awaiting response");
+                    std::string framed = lsp::frame_message(error_resp.dump());
+                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
                 }
             } else {
                 // It's a notification, just fire and forget

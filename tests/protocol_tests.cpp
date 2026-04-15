@@ -2,9 +2,11 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../bridge_app.hpp"
@@ -12,7 +14,30 @@
 #include "../bridge_runtime.hpp"
 
 namespace {
-void test_frame_message() {
+using TestFn = void (*)();
+
+struct NamedTest {
+    const char* name;
+    TestFn fn;
+};
+
+std::vector<NamedTest>& registered_tests() {
+    static std::vector<NamedTest> tests;
+    return tests;
+}
+
+struct TestRegistrar {
+    TestRegistrar(const char* name, TestFn fn) {
+        registered_tests().push_back(NamedTest{name, fn});
+    }
+};
+
+#define DEFINE_TEST(name) \
+    void name(); \
+    const TestRegistrar name##_registrar{#name, &name}; \
+    void name()
+
+DEFINE_TEST(test_frame_message) {
     const std::string payload = R"({"jsonrpc":"2.0","method":"initialize"})";
     const std::string framed = lsp::frame_message(payload);
 
@@ -21,7 +46,7 @@ void test_frame_message() {
     assert(framed.substr(expected_prefix.size()) == payload);
 }
 
-void test_parse_content_length_with_crlf() {
+DEFINE_TEST(test_parse_content_length_with_crlf) {
     const std::string headers = "Content-Length: 123\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n";
     const auto parsed = lsp::parse_content_length(headers);
 
@@ -29,7 +54,7 @@ void test_parse_content_length_with_crlf() {
     assert(*parsed == 123U);
 }
 
-void test_parse_content_length_case_insensitive() {
+DEFINE_TEST(test_parse_content_length_case_insensitive) {
     const std::string headers = "content-length: 42\r\n\r\n";
     const auto parsed = lsp::parse_content_length(headers);
 
@@ -37,19 +62,19 @@ void test_parse_content_length_case_insensitive() {
     assert(*parsed == 42U);
 }
 
-void test_parse_content_length_missing() {
+DEFINE_TEST(test_parse_content_length_missing) {
     const auto parsed = lsp::parse_content_length("Content-Type: text/plain\r\n\r\n");
     assert(!parsed.has_value());
 }
 
-void test_parse_content_length_too_large() {
+DEFINE_TEST(test_parse_content_length_too_large) {
     const std::string headers = "Content-Length: " + std::to_string(lsp::max_content_length + 1) + "\r\n\r\n";
     const auto parsed = lsp::parse_content_length(headers);
 
     assert(!parsed.has_value());
 }
 
-void test_parse_bridge_settings_defaults() {
+DEFINE_TEST(test_parse_bridge_settings_defaults) {
     const BridgeSettings settings = parse_bridge_settings({});
 
     assert(settings.local_port == 6009);
@@ -58,7 +83,7 @@ void test_parse_bridge_settings_defaults() {
     assert(settings.request_timeout == std::chrono::seconds(30));
 }
 
-void test_parse_bridge_settings_overrides() {
+DEFINE_TEST(test_parse_bridge_settings_overrides) {
     const BridgeSettings settings = parse_bridge_settings({
         "--listen-port", "6010",
         "--remote-host", "example.com",
@@ -72,7 +97,7 @@ void test_parse_bridge_settings_overrides() {
     assert(settings.request_timeout == std::chrono::milliseconds(1500));
 }
 
-void test_parse_bridge_settings_rejects_invalid_port() {
+DEFINE_TEST(test_parse_bridge_settings_rejects_invalid_port) {
     bool threw = false;
 
     try {
@@ -84,14 +109,14 @@ void test_parse_bridge_settings_rejects_invalid_port() {
     assert(threw);
 }
 
-void test_bridge_signal_numbers_include_shutdown_signals() {
+DEFINE_TEST(test_bridge_signal_numbers_include_shutdown_signals) {
     const auto signals = bridge_signal_numbers();
 
     assert(std::find(signals.begin(), signals.end(), SIGINT) != signals.end());
     assert(std::find(signals.begin(), signals.end(), SIGTERM) != signals.end());
 }
 
-void test_socket_helpers_identify_and_prune_dead_sockets() {
+DEFINE_TEST(test_socket_helpers_identify_and_prune_dead_sockets) {
     net::io_context ioc;
 
     auto live_socket = std::make_shared<tcp::socket>(ioc);
@@ -109,7 +134,7 @@ void test_socket_helpers_identify_and_prune_dead_sockets() {
     assert(sockets.front().get() == live_socket.get());
 }
 
-void test_close_socket_if_open_closes_socket() {
+DEFINE_TEST(test_close_socket_if_open_closes_socket) {
     net::io_context ioc;
     auto socket = std::make_shared<tcp::socket>(ioc);
     socket->open(tcp::v4());
@@ -121,7 +146,7 @@ void test_close_socket_if_open_closes_socket() {
     assert(!socket->is_open());
 }
 
-void test_jsonrpc_helpers() {
+DEFINE_TEST(test_jsonrpc_helpers) {
     const json response = jsonrpc::create_response(1, json{{"ok", true}});
     assert(response["jsonrpc"] == "2.0");
     assert(response["id"] == 1);
@@ -147,7 +172,7 @@ void test_jsonrpc_helpers() {
     assert(!jsonrpc::is_trackable_request_id(*null_id));
 }
 
-void test_jsonrpc_response_validation() {
+DEFINE_TEST(test_jsonrpc_response_validation) {
     const json valid_response = json{{"jsonrpc", "2.0"}, {"id", 1}, {"result", json{{"ok", true}}}};
     assert(jsonrpc::is_valid_jsonrpc_response(valid_response));
 
@@ -164,7 +189,7 @@ void test_jsonrpc_response_validation() {
     assert(!jsonrpc::is_valid_jsonrpc_notification(invalid_notification_with_id));
 }
 
-void test_response_manager_round_trip() {
+DEFINE_TEST(test_response_manager_round_trip) {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId original_id = std::string{"req-1"};
@@ -192,7 +217,7 @@ void test_response_manager_round_trip() {
     assert((*result->response)["result"]["ok"] == true);
 }
 
-void test_response_manager_integer_id_round_trip() {
+DEFINE_TEST(test_response_manager_integer_id_round_trip) {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId original_id = std::int64_t{17};
@@ -219,7 +244,7 @@ void test_response_manager_integer_id_round_trip() {
     assert((*result->response)["id"] == 17);
 }
 
-void test_response_manager_allows_duplicate_original_ids() {
+DEFINE_TEST(test_response_manager_allows_duplicate_original_ids) {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId original_id = std::int64_t{42};
@@ -267,7 +292,7 @@ void test_response_manager_allows_duplicate_original_ids() {
     assert((*result_b->response)["result"]["which"] == "b");
 }
 
-void test_response_manager_rejects_null_original_ids() {
+DEFINE_TEST(test_response_manager_rejects_null_original_ids) {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     bool threw = false;
@@ -281,7 +306,7 @@ void test_response_manager_rejects_null_original_ids() {
     assert(threw);
 }
 
-void test_response_manager_cancel_all_releases_waiters() {
+DEFINE_TEST(test_response_manager_cancel_all_releases_waiters) {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId id = std::string{"req-cancel"};
@@ -307,7 +332,7 @@ void test_response_manager_cancel_all_releases_waiters() {
     assert(!result->response.has_value());
 }
 
-void test_response_manager_times_out_waiters() {
+DEFINE_TEST(test_response_manager_times_out_waiters) {
     using namespace std::chrono_literals;
 
     net::io_context ioc;
@@ -335,7 +360,7 @@ struct FakeRemote {
     int id = -1;
 };
 
-void test_remote_retry_loop_retries_with_fresh_remote_instances() {
+DEFINE_TEST(test_remote_retry_loop_retries_with_fresh_remote_instances) {
     net::io_context ioc;
     auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
     std::vector<std::shared_ptr<FakeRemote>> created_remotes;
@@ -388,7 +413,7 @@ void test_remote_retry_loop_retries_with_fresh_remote_instances() {
     assert(!active_remote->get());
 }
 
-void test_remote_retry_loop_cancels_pending_responses_after_disconnect() {
+DEFINE_TEST(test_remote_retry_loop_cancels_pending_responses_after_disconnect) {
     net::io_context ioc;
     auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
     auto response_manager = std::make_shared<ResponseManager>();
@@ -440,7 +465,7 @@ void test_remote_retry_loop_cancels_pending_responses_after_disconnect() {
     assert(!active_remote->get());
 }
 
-void test_remote_retry_loop_applies_backoff_after_failure() {
+DEFINE_TEST(test_remote_retry_loop_applies_backoff_after_failure) {
     using namespace std::chrono_literals;
 
     net::io_context ioc;
@@ -472,29 +497,30 @@ void test_remote_retry_loop_applies_backoff_after_failure() {
     assert(attempt_times.size() == 2);
     assert((attempt_times[1] - attempt_times[0]) >= 15ms);
 }
+
+const std::vector<NamedTest>& all_tests() {
+    return registered_tests();
+}
 }
 
-int main() {
-    test_frame_message();
-    test_parse_content_length_with_crlf();
-    test_parse_content_length_case_insensitive();
-    test_parse_content_length_missing();
-    test_parse_content_length_too_large();
-    test_parse_bridge_settings_defaults();
-    test_parse_bridge_settings_overrides();
-    test_parse_bridge_settings_rejects_invalid_port();
-    test_bridge_signal_numbers_include_shutdown_signals();
-    test_socket_helpers_identify_and_prune_dead_sockets();
-    test_close_socket_if_open_closes_socket();
-    test_jsonrpc_helpers();
-    test_response_manager_round_trip();
-    test_response_manager_integer_id_round_trip();
-    test_response_manager_allows_duplicate_original_ids();
-    test_response_manager_rejects_null_original_ids();
-    test_response_manager_cancel_all_releases_waiters();
-    test_response_manager_times_out_waiters();
-    test_remote_retry_loop_retries_with_fresh_remote_instances();
-    test_remote_retry_loop_cancels_pending_responses_after_disconnect();
-    test_remote_retry_loop_applies_backoff_after_failure();
-    return 0;
+int main(int argc, char* argv[]) {
+    const auto& tests = all_tests();
+
+    if (argc == 1) {
+        for (const auto& test : tests) {
+            test.fn();
+        }
+        return 0;
+    }
+
+    const std::string requested_test = argv[1];
+    for (const auto& test : tests) {
+        if (requested_test == test.name) {
+            test.fn();
+            return 0;
+        }
+    }
+
+    std::fprintf(stderr, "Unknown test: %s\n", requested_test.c_str());
+    return 1;
 }

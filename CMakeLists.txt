@@ -32,4 +32,15 @@ target_link_libraries(dltxt_bridge_tests PRIVATE
   nlohmann_json::nlohmann_json
 )
 
-add_test(NAME dltxt_bridge_tests COMMAND dltxt_bridge_tests)
+file(STRINGS tests/protocol_tests.cpp DLTXT_BRIDGE_TEST_CASE_LINES
+  REGEX "^[ 	]*DEFINE_TEST\\(test_[A-Za-z0-9_]+\\)[ 	]*\\{")
+
+set(DLTXT_BRIDGE_TEST_CASES)
+foreach(test_case_line IN LISTS DLTXT_BRIDGE_TEST_CASE_LINES)
+  string(REGEX REPLACE "^[ 	]*DEFINE_TEST\\((test_[A-Za-z0-9_]+)\\)[ 	]*\\{$" "\\1" test_case "${test_case_line}")
+  list(APPEND DLTXT_BRIDGE_TEST_CASES ${test_case})
+endforeach()
+
+foreach(test_case IN LISTS DLTXT_BRIDGE_TEST_CASES)
+  add_test(NAME ${test_case} COMMAND dltxt_bridge_tests ${test_case})
+endforeach()
