@@ -172,9 +172,17 @@ net::awaitable<void> handle_local_session(
             
             
             if (request.contains("id")) {
-                auto id = request["id"];
+                auto maybe_id = jsonrpc::request_id_from_json(request["id"]);
+                if (!maybe_id.has_value()) {
+                    json error_resp = jsonrpc::create_error(request["id"], -32600, "Invalid Request id");
+                    std::string framed = lsp::frame_message(error_resp.dump());
+                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                    continue;
+                }
+
+                RequestId id = *maybe_id;
                 auto executor = co_await net::this_coro::executor;
-                auto tracker = response_manager->create_request_tracker(id, executor);
+                response_manager->create_request_tracker(id, executor);
 
                 // RAII Guard: Automatically calls cleanup(id) when this object goes out of scope
                 ResponseCleanup guard{response_manager, id};
@@ -227,7 +235,10 @@ net::awaitable<void> remote_reader(
             if (is_json) {
                 // If it has an id, it's a response to a specific request
                 if (response.contains("id")) {
-                    response_manager->store_response(response["id"], response);
+                    auto maybe_id = jsonrpc::request_id_from_json(response["id"]);
+                    if (maybe_id.has_value()) {
+                        response_manager->store_response(*maybe_id, response);
+                    }
                 } else {
                     // Otherwise broadcast as notification to all local sessions
                     co_await session_manager->broadcast(message);

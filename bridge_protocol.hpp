@@ -4,17 +4,21 @@
 #include <boost/beast.hpp>
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <deque>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 
 #include <nlohmann/json.hpp>
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
 using json = nlohmann::json;
+using RequestId = std::variant<std::monostate, std::int64_t, std::string>;
 
 namespace lsp {
 inline std::string frame_message(const std::string& payload) {
@@ -83,6 +87,42 @@ net::awaitable<std::optional<std::string>> read_message(AsyncReadStream& stream,
 }
 
 namespace jsonrpc {
+inline std::optional<RequestId> request_id_from_json(const json& id) {
+    if (id.is_null()) {
+        return RequestId{std::monostate{}};
+    }
+
+    if (id.is_string()) {
+        return RequestId{id.get<std::string>()};
+    }
+
+    if (id.is_number_integer()) {
+        return RequestId{id.get<std::int64_t>()};
+    }
+
+    if (id.is_number_unsigned()) {
+        const auto value = id.get<std::uint64_t>();
+        if (value <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            return RequestId{static_cast<std::int64_t>(value)};
+        }
+    }
+
+    return std::nullopt;
+}
+
+inline json request_id_to_json(const RequestId& id) {
+    return std::visit(
+        [](const auto& value) -> json {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, std::monostate>) {
+                return nullptr;
+            } else {
+                return value;
+            }
+        },
+        id);
+}
+
 inline json create_response(const json& id, const json& result) {
     return json{
         {"jsonrpc", "2.0"},
@@ -114,17 +154,17 @@ private:
         std::deque<json> responses;
         std::unique_ptr<net::steady_timer> signal;
     };
-    std::map<json, std::shared_ptr<Tracker>> pending_responses_;
+    std::map<RequestId, std::shared_ptr<Tracker>> pending_responses_;
 
 public:
-    std::shared_ptr<Tracker> create_request_tracker(const json& id, net::any_io_executor ex) {
+    std::shared_ptr<Tracker> create_request_tracker(const RequestId& id, net::any_io_executor ex) {
         auto tracker = std::make_shared<Tracker>();
         tracker->signal = std::make_unique<net::steady_timer>(ex, std::chrono::steady_clock::time_point::max());
         pending_responses_[id] = tracker;
         return tracker;
     }
 
-    net::awaitable<std::optional<json>> wait_for_response(json id) {
+    net::awaitable<std::optional<json>> wait_for_response(const RequestId& id) {
         auto it = pending_responses_.find(id);
         std::shared_ptr<Tracker> tracker = it != pending_responses_.end() ? it->second : nullptr;
 
@@ -140,7 +180,7 @@ public:
         co_return std::nullopt;
     }
 
-    void store_response(const json& id, const json& response) {
+    void store_response(const RequestId& id, const json& response) {
         auto it = pending_responses_.find(id);
         if (it != pending_responses_.end()) {
             it->second->responses.push_back(response);
@@ -148,13 +188,13 @@ public:
         }
     }
 
-    void cleanup(const json& id) {
+    void cleanup(const RequestId& id) {
         pending_responses_.erase(id);
     }
 };
 
 struct ResponseCleanup {
     std::shared_ptr<ResponseManager> manager;
-    json id;
+    RequestId id;
     ~ResponseCleanup() { manager->cleanup(id); }
 };

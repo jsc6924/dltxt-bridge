@@ -46,12 +46,23 @@ void test_jsonrpc_helpers() {
     const json error = jsonrpc::create_error(2, -32600, "Invalid Request");
     assert(error["error"]["code"] == -32600);
     assert(error["error"]["message"] == "Invalid Request");
+
+    const auto string_id = jsonrpc::request_id_from_json("abc");
+    assert(string_id.has_value());
+    assert(jsonrpc::request_id_to_json(*string_id) == "abc");
+
+    const auto integer_id = jsonrpc::request_id_from_json(7);
+    assert(integer_id.has_value());
+    assert(jsonrpc::request_id_to_json(*integer_id) == 7);
+
+    const auto invalid_id = jsonrpc::request_id_from_json(3.14);
+    assert(!invalid_id.has_value());
 }
 
 void test_response_manager_round_trip() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
-    const json id = "req-1";
+    const RequestId id = std::string{"req-1"};
     manager->create_request_tracker(id, ioc.get_executor());
 
     std::optional<json> result;
@@ -64,13 +75,38 @@ void test_response_manager_round_trip() {
         net::detached);
 
     net::post(ioc, [manager, id]() {
-        manager->store_response(id, json{{"jsonrpc", "2.0"}, {"id", id}, {"result", json{{"ok", true}}}});
+        manager->store_response(id, json{{"jsonrpc", "2.0"}, {"id", jsonrpc::request_id_to_json(id)}, {"result", json{{"ok", true}}}});
     });
 
     ioc.run();
 
     assert(result.has_value());
     assert((*result)["result"]["ok"] == true);
+}
+
+void test_response_manager_integer_id_round_trip() {
+    net::io_context ioc;
+    auto manager = std::make_shared<ResponseManager>();
+    const RequestId id = std::int64_t{17};
+    manager->create_request_tracker(id, ioc.get_executor());
+
+    std::optional<json> result;
+
+    net::co_spawn(ioc,
+        [manager, &result, id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(id);
+            co_return;
+        },
+        net::detached);
+
+    net::post(ioc, [manager, id]() {
+        manager->store_response(id, json{{"jsonrpc", "2.0"}, {"id", 17}, {"result", json{{"ok", true}}}});
+    });
+
+    ioc.run();
+
+    assert(result.has_value());
+    assert((*result)["id"] == 17);
 }
 }
 
@@ -81,5 +117,6 @@ int main() {
     test_parse_content_length_missing();
     test_jsonrpc_helpers();
     test_response_manager_round_trip();
+    test_response_manager_integer_id_round_trip();
     return 0;
 }
