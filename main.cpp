@@ -1,54 +1,17 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
+#include "bridge_app.hpp"
 #include "bridge_protocol.hpp"
 #include "bridge_runtime.hpp"
 #include <cstdio>
-#include <string>
+#include <exception>
 #include <memory>
-#include <vector>
 #include <deque>
 
-namespace net = boost::asio;
 namespace beast = boost::beast;
-using tcp = net::ip::tcp;
 namespace websocket = beast::websocket;
 using RemoteRegistry = ActiveRemote<class RemoteClient>;
-
-class LocalSessionManager {
-private:
-    std::vector<std::shared_ptr<tcp::socket>> sockets_;
-
-public:
-    void register_socket(std::shared_ptr<tcp::socket> socket) {
-        sockets_.push_back(socket);
-    }
-
-    void unregister_socket(std::shared_ptr<tcp::socket> socket) {
-        sockets_.erase(
-            std::remove_if(sockets_.begin(), sockets_.end(),
-                [socket](const std::shared_ptr<tcp::socket>& s) {
-                    return s.get() == socket.get();
-                }),
-            sockets_.end()
-        );
-    }
-
-    net::awaitable<void> broadcast(std::string message) {
-        std::vector<std::shared_ptr<tcp::socket>> sockets_copy = sockets_;
-        std::string framed_message = lsp::frame_message(message);
-        
-        for (auto& socket : sockets_copy) {
-            if (socket && socket->is_open()) {
-                try {
-                    co_await net::async_write(*socket, net::buffer(framed_message), net::use_awaitable);
-                } catch (...) {
-                    // Socket may be closed, skip
-                }
-            }
-        }
-    }
-};
 
 class RemoteClient {
     net::strand<net::any_io_executor> strand_;
@@ -284,8 +247,9 @@ net::awaitable<void> listener(
     }
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
+        const BridgeSettings settings = parse_bridge_settings(argc, argv);
         net::io_context ioc;
 
         auto remote_registry = std::make_shared<RemoteRegistry>();
@@ -293,19 +257,19 @@ int main() {
         auto response_manager = std::make_shared<ResponseManager>();
 
         // Launch ONE coordinator coroutine to handle startup order
-        net::co_spawn(ioc, [remote_registry, session_manager, response_manager]() mutable -> net::awaitable<void> {
+        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, settings]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
-            net::co_spawn(ex, listener(6009, remote_registry, session_manager, response_manager), net::detached);
+            net::co_spawn(ex, listener(settings.local_port, remote_registry, session_manager, response_manager), net::detached);
 
             co_await run_remote_retry_loop(
                 remote_registry,
                 [](net::any_io_executor executor) {
                     return std::make_shared<RemoteClient>(executor);
                 },
-                [session_manager, response_manager](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
+                [session_manager, response_manager, settings](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
                     try {
                         // WAIT for the connection to be fully established
-                        co_await remote_client_ptr->connect("127.0.0.1", "9000");
+                        co_await remote_client_ptr->connect(settings.remote_host, settings.remote_port);
 
                         // Start the loops that depend on that connection
                         co_await remote_reader(remote_client_ptr, session_manager, response_manager);
@@ -333,6 +297,10 @@ int main() {
         }, net::detached);
 
         ioc.run();
+    } catch (const std::invalid_argument& e) {
+        fprintf(stderr, "Configuration Error: %s\n", e.what());
+        fprintf(stderr, "Usage: dltxt_bridge [--listen-port <port>] [--remote-host <host>] [--remote-port <port>]\n");
+        return 1;
     } catch (std::exception& e) {
         fprintf(stderr, "Bridge Error: %s\n", e.what());
         return 1;

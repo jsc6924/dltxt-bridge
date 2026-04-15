@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "../bridge_app.hpp"
 #include "../bridge_protocol.hpp"
 #include "../bridge_runtime.hpp"
 
@@ -46,6 +47,56 @@ void test_parse_content_length_too_large() {
     const auto parsed = lsp::parse_content_length(headers);
 
     assert(!parsed.has_value());
+}
+
+void test_parse_bridge_settings_defaults() {
+    const BridgeSettings settings = parse_bridge_settings({});
+
+    assert(settings.local_port == 6009);
+    assert(settings.remote_host == "127.0.0.1");
+    assert(settings.remote_port == "9000");
+}
+
+void test_parse_bridge_settings_overrides() {
+    const BridgeSettings settings = parse_bridge_settings({
+        "--listen-port", "6010",
+        "--remote-host", "example.com",
+        "--remote-port", "9010"
+    });
+
+    assert(settings.local_port == 6010);
+    assert(settings.remote_host == "example.com");
+    assert(settings.remote_port == "9010");
+}
+
+void test_parse_bridge_settings_rejects_invalid_port() {
+    bool threw = false;
+
+    try {
+        static_cast<void>(parse_bridge_settings({"--listen-port", "70000"}));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+
+    assert(threw);
+}
+
+void test_socket_helpers_identify_and_prune_dead_sockets() {
+    net::io_context ioc;
+
+    auto live_socket = std::make_shared<tcp::socket>(ioc);
+    live_socket->open(tcp::v4());
+
+    auto dead_socket = std::make_shared<tcp::socket>(ioc);
+    std::vector<std::shared_ptr<tcp::socket>> sockets{live_socket, dead_socket};
+
+    assert(!socket_is_dead(live_socket));
+    assert(socket_is_dead(dead_socket));
+
+    erase_sockets_by_identity(sockets, {dead_socket});
+
+    assert(sockets.size() == 1);
+    assert(sockets.front().get() == live_socket.get());
 }
 
 void test_jsonrpc_helpers() {
@@ -292,6 +343,10 @@ int main() {
     test_parse_content_length_case_insensitive();
     test_parse_content_length_missing();
     test_parse_content_length_too_large();
+    test_parse_bridge_settings_defaults();
+    test_parse_bridge_settings_overrides();
+    test_parse_bridge_settings_rejects_invalid_port();
+    test_socket_helpers_identify_and_prune_dead_sockets();
     test_jsonrpc_helpers();
     test_response_manager_round_trip();
     test_response_manager_integer_id_round_trip();

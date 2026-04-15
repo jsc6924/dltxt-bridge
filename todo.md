@@ -9,7 +9,6 @@ After remote_reader throws on disconnect, the for(;;) loop calls connect() again
 The steady_timer is set to time_point::max(). When the Go backend drops, no code cancels these timers. Every handle_local_session coroutine awaiting a response is permanently stuck, freezing the VS Code client.
 Fix: add a cancel_all() to ResponseManager and call it on reconnect.
 
-
 4. Unbounded Content-Length — OOM / DoS — lsp::read_message, lsp::parse_content_length
 std::stoull has no upper bound. A client sending Content-Length: 9999999999 causes the bridge to attempt allocating and reading gigabytes.
 Fix: reject any Content-Length above a reasonable cap (e.g., 10 MB).
