@@ -2,6 +2,7 @@
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
 #include "bridge_protocol.hpp"
+#include "bridge_runtime.hpp"
 #include <cstdio>
 #include <string>
 #include <memory>
@@ -12,6 +13,7 @@ namespace net = boost::asio;
 namespace beast = boost::beast;
 using tcp = net::ip::tcp;
 namespace websocket = beast::websocket;
+using RemoteRegistry = ActiveRemote<class RemoteClient>;
 
 class LocalSessionManager {
 private:
@@ -114,7 +116,7 @@ public:
 
 net::awaitable<void> handle_local_session(
     tcp::socket socket, 
-    std::shared_ptr<RemoteClient> remote,
+    std::shared_ptr<RemoteRegistry> remote_registry,
     std::shared_ptr<LocalSessionManager> session_manager,
     std::shared_ptr<ResponseManager> response_manager) {
     
@@ -170,6 +172,15 @@ net::awaitable<void> handle_local_session(
             
             printf("JSON-RPC Request: %s\n", request.dump().c_str());
             
+            auto remote = remote_registry->get();
+            if (!remote) {
+                if (request.contains("id")) {
+                    json error_resp = jsonrpc::create_error(request["id"], -32000, "Remote server unavailable");
+                    std::string framed = lsp::frame_message(error_resp.dump());
+                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                }
+                continue;
+            }
             
             if (request.contains("id")) {
                 auto maybe_id = jsonrpc::request_id_from_json(request["id"]);
@@ -244,8 +255,8 @@ net::awaitable<void> remote_reader(
                     co_await session_manager->broadcast(message);
                 }
             } else {
-                // If not JSON, just broadcast
-                co_await session_manager->broadcast(message);
+                // If not JSON, print error and move on
+                fprintf(stderr, "Received non-JSON message from Go backend: %s\n", message.c_str());
             }
         }
     } catch (std::exception& e) {
@@ -255,7 +266,7 @@ net::awaitable<void> remote_reader(
 // Coroutine to listen for new VS Code windows
 net::awaitable<void> listener(
     unsigned short port, 
-    std::shared_ptr<RemoteClient> remote_client_ptr,
+    std::shared_ptr<RemoteRegistry> remote_registry,
     std::shared_ptr<LocalSessionManager> session_manager,
     std::shared_ptr<ResponseManager> response_manager) {
     auto executor = co_await net::this_coro::executor;
@@ -267,7 +278,7 @@ net::awaitable<void> listener(
         tcp::socket socket = co_await acceptor.async_accept(net::use_awaitable);
 
         net::co_spawn(socket.get_executor(), 
-            handle_local_session(std::move(socket), remote_client_ptr, session_manager, response_manager), 
+            handle_local_session(std::move(socket), remote_registry, session_manager, response_manager), 
             net::detached);
     }
 }
@@ -276,26 +287,39 @@ int main() {
     try {
         net::io_context ioc;
 
-        auto remote_client_ptr = std::make_shared<RemoteClient>(ioc.get_executor());
+        auto remote_registry = std::make_shared<RemoteRegistry>();
         auto session_manager = std::make_shared<LocalSessionManager>();
         auto response_manager = std::make_shared<ResponseManager>();
 
         // Launch ONE coordinator coroutine to handle startup order
-        net::co_spawn(ioc, [remote_client_ptr, session_manager, response_manager]() mutable -> net::awaitable<void> {
+        net::co_spawn(ioc, [remote_registry, session_manager, response_manager]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
-            net::co_spawn(ex, listener(6009, remote_client_ptr, session_manager, response_manager), net::detached);
+            net::co_spawn(ex, listener(6009, remote_registry, session_manager, response_manager), net::detached);
 
-            for(;;) {
-                try {
+            co_await run_remote_retry_loop(
+                remote_registry,
+                [](net::any_io_executor executor) {
+                    return std::make_shared<RemoteClient>(executor);
+                },
+                [session_manager, response_manager](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
                     // WAIT for the connection to be fully established
                     co_await remote_client_ptr->connect("127.0.0.1", "9000");
 
                     // Start the loops that depend on that connection
                     co_await remote_reader(remote_client_ptr, session_manager, response_manager);
-                } catch (std::exception& e) {
-                    fprintf(stderr, "Startup or Connection Error: %s\n", e.what());
+                },
+                [](std::exception_ptr error) {
+                    try {
+                        if (error) {
+                            std::rethrow_exception(error);
+                        }
+                    } catch (const std::exception& e) {
+                        fprintf(stderr, "Startup or Connection Error: %s\n", e.what());
+                    } catch (...) {
+                        fprintf(stderr, "Startup or Connection Error: unknown exception\n");
+                    }
                 }
-            }
+            );
             
             co_return;
         }, net::detached);

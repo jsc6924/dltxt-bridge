@@ -2,9 +2,12 @@
 
 #include <cassert>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "../bridge_protocol.hpp"
+#include "../bridge_runtime.hpp"
 
 namespace {
 void test_frame_message() {
@@ -108,6 +111,63 @@ void test_response_manager_integer_id_round_trip() {
     assert(result.has_value());
     assert((*result)["id"] == 17);
 }
+
+struct FakeRemote {
+    int id = -1;
+};
+
+void test_remote_retry_loop_retries_with_fresh_remote_instances() {
+    net::io_context ioc;
+    auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
+    std::vector<std::shared_ptr<FakeRemote>> created_remotes;
+    std::vector<int> attempted_ids;
+    int error_count = 0;
+
+    net::co_spawn(ioc,
+        run_remote_retry_loop(
+            active_remote,
+            [&created_remotes](boost::asio::any_io_executor) {
+                auto remote = std::make_shared<FakeRemote>();
+                remote->id = static_cast<int>(created_remotes.size());
+                created_remotes.push_back(remote);
+                return remote;
+            },
+            [&attempted_ids, active_remote](const std::shared_ptr<FakeRemote>& remote) -> net::awaitable<void> {
+                assert(active_remote->get() == remote);
+                attempted_ids.push_back(remote->id);
+
+                if (remote->id == 0) {
+                    throw std::runtime_error("disconnect");
+                }
+
+                co_return;
+            },
+            [&error_count](std::exception_ptr error) {
+                ++error_count;
+
+                try {
+                    if (error) {
+                        std::rethrow_exception(error);
+                    }
+                } catch (const std::runtime_error& e) {
+                    assert(std::string(e.what()) == "disconnect");
+                } catch (...) {
+                    assert(false);
+                }
+            },
+            2),
+        net::detached);
+
+    ioc.run();
+
+    assert(created_remotes.size() == 2);
+    assert(created_remotes[0] != created_remotes[1]);
+    assert(attempted_ids.size() == 2);
+    assert(attempted_ids[0] == 0);
+    assert(attempted_ids[1] == 1);
+    assert(error_count == 1);
+    assert(!active_remote->get());
+}
 }
 
 int main() {
@@ -118,5 +178,6 @@ int main() {
     test_jsonrpc_helpers();
     test_response_manager_round_trip();
     test_response_manager_integer_id_round_trip();
+    test_remote_retry_loop_retries_with_fresh_remote_instances();
     return 0;
 }
