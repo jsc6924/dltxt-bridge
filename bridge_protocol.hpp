@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <variant>
 
 #include <nlohmann/json.hpp>
@@ -164,27 +165,47 @@ private:
     std::map<RequestId, std::shared_ptr<Tracker>> pending_responses_;
 
 public:
-    std::shared_ptr<Tracker> create_request_tracker(const RequestId& id, net::any_io_executor ex) {
+    enum class WaitStatus {
+        response_ready,
+        timed_out,
+        cancelled,
+    };
+
+    struct WaitResult {
+        WaitStatus status = WaitStatus::cancelled;
+        std::optional<json> response;
+    };
+
+    std::shared_ptr<Tracker> create_request_tracker(
+        const RequestId& id,
+        net::any_io_executor ex,
+        std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
+
         auto tracker = std::make_shared<Tracker>();
-        tracker->signal = std::make_unique<net::steady_timer>(ex, std::chrono::steady_clock::time_point::max());
+        tracker->signal = std::make_unique<net::steady_timer>(ex, timeout);
         pending_responses_[id] = tracker;
         return tracker;
     }
 
-    net::awaitable<std::optional<json>> wait_for_response(const RequestId& id) {
+    net::awaitable<WaitResult> wait_for_response(const RequestId& id) {
         auto it = pending_responses_.find(id);
         std::shared_ptr<Tracker> tracker = it != pending_responses_.end() ? it->second : nullptr;
 
         if (tracker) {
-            co_await tracker->signal->async_wait(net::as_tuple(net::use_awaitable));
+            auto [error] = co_await tracker->signal->async_wait(net::as_tuple(net::use_awaitable));
 
             if (!tracker->responses.empty()) {
                 json response = std::move(tracker->responses.front());
                 tracker->responses.pop_front();
-                co_return response;
+                co_return WaitResult{WaitStatus::response_ready, std::move(response)};
+            }
+
+            if (!error) {
+                co_return WaitResult{WaitStatus::timed_out, std::nullopt};
             }
         }
-        co_return std::nullopt;
+
+        co_return WaitResult{WaitStatus::cancelled, std::nullopt};
     }
 
     void store_response(const RequestId& id, const json& response) {

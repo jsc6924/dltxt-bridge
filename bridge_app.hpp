@@ -3,6 +3,7 @@
 #include <boost/asio.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,7 @@ struct BridgeSettings {
     unsigned short local_port = 6009;
     std::string remote_host = "127.0.0.1";
     std::string remote_port = "9000";
+    std::chrono::milliseconds request_timeout = std::chrono::seconds(30);
 };
 
 inline bool socket_is_dead(const std::shared_ptr<tcp::socket>& socket) {
@@ -56,6 +58,19 @@ inline unsigned short parse_port_number(const std::string& value, const char* op
     }
 }
 
+inline std::chrono::milliseconds parse_timeout_ms(const std::string& value, const char* option_name) {
+    try {
+        const auto parsed = std::stoull(value);
+        if (parsed == 0) {
+            throw std::out_of_range("timeout out of range");
+        }
+
+        return std::chrono::milliseconds(parsed);
+    } catch (...) {
+        throw std::invalid_argument(std::string("Invalid value for ") + option_name + ": " + value);
+    }
+}
+
 inline BridgeSettings parse_bridge_settings(const std::vector<std::string>& args) {
     BridgeSettings settings;
 
@@ -85,6 +100,15 @@ inline BridgeSettings parse_bridge_settings(const std::vector<std::string>& args
             }
 
             settings.remote_port = args[++index];
+            continue;
+        }
+
+        if (arg == "--request-timeout-ms") {
+            if (index + 1 >= args.size()) {
+                throw std::invalid_argument("Missing value for --request-timeout-ms");
+            }
+
+            settings.request_timeout = parse_timeout_ms(args[++index], "--request-timeout-ms");
             continue;
         }
 

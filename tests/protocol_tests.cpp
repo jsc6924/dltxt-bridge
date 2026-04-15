@@ -55,18 +55,21 @@ void test_parse_bridge_settings_defaults() {
     assert(settings.local_port == 6009);
     assert(settings.remote_host == "127.0.0.1");
     assert(settings.remote_port == "9000");
+    assert(settings.request_timeout == std::chrono::seconds(30));
 }
 
 void test_parse_bridge_settings_overrides() {
     const BridgeSettings settings = parse_bridge_settings({
         "--listen-port", "6010",
         "--remote-host", "example.com",
-        "--remote-port", "9010"
+        "--remote-port", "9010",
+        "--request-timeout-ms", "1500"
     });
 
     assert(settings.local_port == 6010);
     assert(settings.remote_host == "example.com");
     assert(settings.remote_port == "9010");
+    assert(settings.request_timeout == std::chrono::milliseconds(1500));
 }
 
 void test_parse_bridge_settings_rejects_invalid_port() {
@@ -127,7 +130,7 @@ void test_response_manager_round_trip() {
     const RequestId id = std::string{"req-1"};
     manager->create_request_tracker(id, ioc.get_executor());
 
-    std::optional<json> result;
+    std::optional<ResponseManager::WaitResult> result;
 
     net::co_spawn(ioc,
         [manager, &result, id]() -> net::awaitable<void> {
@@ -143,7 +146,9 @@ void test_response_manager_round_trip() {
     ioc.run();
 
     assert(result.has_value());
-    assert((*result)["result"]["ok"] == true);
+    assert(result->status == ResponseManager::WaitStatus::response_ready);
+    assert(result->response.has_value());
+    assert((*result->response)["result"]["ok"] == true);
 }
 
 void test_response_manager_integer_id_round_trip() {
@@ -152,7 +157,7 @@ void test_response_manager_integer_id_round_trip() {
     const RequestId id = std::int64_t{17};
     manager->create_request_tracker(id, ioc.get_executor());
 
-    std::optional<json> result;
+    std::optional<ResponseManager::WaitResult> result;
 
     net::co_spawn(ioc,
         [manager, &result, id]() -> net::awaitable<void> {
@@ -168,7 +173,9 @@ void test_response_manager_integer_id_round_trip() {
     ioc.run();
 
     assert(result.has_value());
-    assert((*result)["id"] == 17);
+    assert(result->status == ResponseManager::WaitStatus::response_ready);
+    assert(result->response.has_value());
+    assert((*result->response)["id"] == 17);
 }
 
 void test_response_manager_cancel_all_releases_waiters() {
@@ -177,7 +184,7 @@ void test_response_manager_cancel_all_releases_waiters() {
     const RequestId id = std::string{"req-cancel"};
     manager->create_request_tracker(id, ioc.get_executor());
 
-    std::optional<json> result;
+    std::optional<ResponseManager::WaitResult> result;
 
     net::co_spawn(ioc,
         [manager, &result, id]() -> net::awaitable<void> {
@@ -192,7 +199,33 @@ void test_response_manager_cancel_all_releases_waiters() {
 
     ioc.run();
 
-    assert(!result.has_value());
+    assert(result.has_value());
+    assert(result->status == ResponseManager::WaitStatus::cancelled);
+    assert(!result->response.has_value());
+}
+
+void test_response_manager_times_out_waiters() {
+    using namespace std::chrono_literals;
+
+    net::io_context ioc;
+    auto manager = std::make_shared<ResponseManager>();
+    const RequestId id = std::string{"req-timeout"};
+    manager->create_request_tracker(id, ioc.get_executor(), 20ms);
+
+    std::optional<ResponseManager::WaitResult> result;
+
+    net::co_spawn(ioc,
+        [manager, &result, id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(id);
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(result.has_value());
+    assert(result->status == ResponseManager::WaitStatus::timed_out);
+    assert(!result->response.has_value());
 }
 
 struct FakeRemote {
@@ -258,7 +291,7 @@ void test_remote_retry_loop_cancels_pending_responses_after_disconnect() {
     auto response_manager = std::make_shared<ResponseManager>();
     const RequestId id = std::string{"req-disconnect"};
 
-    std::optional<json> result;
+    std::optional<ResponseManager::WaitResult> result;
     int error_count = 0;
 
     response_manager->create_request_tracker(id, ioc.get_executor());
@@ -299,7 +332,8 @@ void test_remote_retry_loop_cancels_pending_responses_after_disconnect() {
     ioc.run();
 
     assert(error_count == 1);
-    assert(!result.has_value());
+    assert(result.has_value());
+    assert(result->status == ResponseManager::WaitStatus::cancelled);
     assert(!active_remote->get());
 }
 
@@ -351,6 +385,7 @@ int main() {
     test_response_manager_round_trip();
     test_response_manager_integer_id_round_trip();
     test_response_manager_cancel_all_releases_waiters();
+    test_response_manager_times_out_waiters();
     test_remote_retry_loop_retries_with_fresh_remote_instances();
     test_remote_retry_loop_cancels_pending_responses_after_disconnect();
     test_remote_retry_loop_applies_backoff_after_failure();

@@ -81,7 +81,8 @@ net::awaitable<void> handle_local_session(
     tcp::socket socket, 
     std::shared_ptr<RemoteRegistry> remote_registry,
     std::shared_ptr<LocalSessionManager> session_manager,
-    std::shared_ptr<ResponseManager> response_manager) {
+    std::shared_ptr<ResponseManager> response_manager,
+    std::chrono::milliseconds request_timeout) {
     
     auto socket_ptr = std::make_shared<tcp::socket>(std::move(socket));
     session_manager->register_socket(socket_ptr);
@@ -156,7 +157,7 @@ net::awaitable<void> handle_local_session(
 
                 RequestId id = *maybe_id;
                 auto executor = co_await net::this_coro::executor;
-                response_manager->create_request_tracker(id, executor);
+                response_manager->create_request_tracker(id, executor, request_timeout);
 
                 // RAII Guard: Automatically calls cleanup(id) when this object goes out of scope
                 ResponseCleanup guard{response_manager, id};
@@ -164,15 +165,19 @@ net::awaitable<void> handle_local_session(
                 // Forward request to Go
                 co_await remote->send(request.dump());
 
-                auto maybe_response = co_await response_manager->wait_for_response(id);
+                auto wait_result = co_await response_manager->wait_for_response(id);
 
-                if (maybe_response.has_value()) {
-                    std::string out = lsp::frame_message(maybe_response->dump());
+                if (wait_result.status == ResponseManager::WaitStatus::response_ready && wait_result.response.has_value()) {
+                    std::string out = lsp::frame_message(wait_result.response->dump());
                     co_await net::async_write(
                         *socket_ptr, 
                         net::buffer(out), 
                         net::use_awaitable
                     );
+                } else if (wait_result.status == ResponseManager::WaitStatus::timed_out) {
+                    json error_resp = jsonrpc::create_error(request["id"], -32001, "Request timed out");
+                    std::string framed = lsp::frame_message(error_resp.dump());
+                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
                 }
             } else {
                 // It's a notification, just fire and forget
@@ -232,7 +237,8 @@ net::awaitable<void> listener(
     unsigned short port, 
     std::shared_ptr<RemoteRegistry> remote_registry,
     std::shared_ptr<LocalSessionManager> session_manager,
-    std::shared_ptr<ResponseManager> response_manager) {
+    std::shared_ptr<ResponseManager> response_manager,
+    std::chrono::milliseconds request_timeout) {
     auto executor = co_await net::this_coro::executor;
     tcp::acceptor acceptor(executor, {tcp::v4(), port});
     
@@ -242,7 +248,7 @@ net::awaitable<void> listener(
         tcp::socket socket = co_await acceptor.async_accept(net::use_awaitable);
 
         net::co_spawn(socket.get_executor(), 
-            handle_local_session(std::move(socket), remote_registry, session_manager, response_manager), 
+            handle_local_session(std::move(socket), remote_registry, session_manager, response_manager, request_timeout), 
             net::detached);
     }
 }
@@ -259,7 +265,7 @@ int main(int argc, char* argv[]) {
         // Launch ONE coordinator coroutine to handle startup order
         net::co_spawn(ioc, [remote_registry, session_manager, response_manager, settings]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
-            net::co_spawn(ex, listener(settings.local_port, remote_registry, session_manager, response_manager), net::detached);
+            net::co_spawn(ex, listener(settings.local_port, remote_registry, session_manager, response_manager, settings.request_timeout), net::detached);
 
             co_await run_remote_retry_loop(
                 remote_registry,
@@ -299,7 +305,7 @@ int main(int argc, char* argv[]) {
         ioc.run();
     } catch (const std::invalid_argument& e) {
         fprintf(stderr, "Configuration Error: %s\n", e.what());
-        fprintf(stderr, "Usage: dltxt_bridge [--listen-port <port>] [--remote-host <host>] [--remote-port <port>]\n");
+        fprintf(stderr, "Usage: dltxt_bridge [--listen-port <port>] [--remote-host <host>] [--remote-port <port>] [--request-timeout-ms <ms>]\n");
         return 1;
     } catch (std::exception& e) {
         fprintf(stderr, "Bridge Error: %s\n", e.what());
