@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <variant>
@@ -95,6 +96,10 @@ net::awaitable<std::optional<std::string>> read_message(AsyncReadStream& stream,
 }
 
 namespace jsonrpc {
+inline bool is_trackable_request_id(const RequestId& id) {
+    return !std::holds_alternative<std::monostate>(id);
+}
+
 inline std::optional<RequestId> request_id_from_json(const json& id) {
     if (id.is_null()) {
         return RequestId{std::monostate{}};
@@ -129,6 +134,44 @@ inline json request_id_to_json(const RequestId& id) {
             }
         },
         id);
+}
+
+inline bool is_valid_jsonrpc_response(const json& message) {
+    if (!message.is_object()) {
+        return false;
+    }
+
+    if (!message.contains("jsonrpc") || message["jsonrpc"] != "2.0") {
+        return false;
+    }
+
+    if (!message.contains("id")) {
+        return false;
+    }
+
+    if (message.contains("method")) {
+        return false;
+    }
+
+    const bool has_result = message.contains("result");
+    const bool has_error = message.contains("error");
+    return has_result ^ has_error;
+}
+
+inline bool is_valid_jsonrpc_notification(const json& message) {
+    if (!message.is_object()) {
+        return false;
+    }
+
+    if (!message.contains("jsonrpc") || message["jsonrpc"] != "2.0") {
+        return false;
+    }
+
+    if (!message.contains("method")) {
+        return false;
+    }
+
+    return !message.contains("id");
 }
 
 inline json create_response(const json& id, const json& result) {
@@ -178,10 +221,14 @@ public:
         std::optional<json> response;
     };
 
-    RequestId create_request_tracker(
+    RequestId create_bridge_request_id(
         const RequestId& original_id,
         net::any_io_executor ex,
         std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
+
+        if (!jsonrpc::is_trackable_request_id(original_id)) {
+            throw std::invalid_argument("Null request IDs are not trackable");
+        }
 
         RequestId bridge_id = std::string{"bridge-" + std::to_string(++next_bridge_request_id_)};
         auto tracker = std::make_shared<Tracker>();

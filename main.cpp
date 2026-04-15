@@ -148,7 +148,7 @@ net::awaitable<void> handle_local_session(
             
             if (request.contains("id")) {
                 auto maybe_id = jsonrpc::request_id_from_json(request["id"]);
-                if (!maybe_id.has_value()) {
+                if (!maybe_id.has_value() || !jsonrpc::is_trackable_request_id(*maybe_id)) {
                     json error_resp = jsonrpc::create_error(request["id"], -32600, "Invalid Request id");
                     std::string framed = lsp::frame_message(error_resp.dump());
                     co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
@@ -158,7 +158,7 @@ net::awaitable<void> handle_local_session(
                 RequestId original_id = *maybe_id;
                 json original_id_json = request["id"];
                 auto executor = co_await net::this_coro::executor;
-                RequestId bridge_id = response_manager->create_request_tracker(original_id, executor, request_timeout);
+                RequestId bridge_id = response_manager->create_bridge_request_id(original_id, executor, request_timeout);
                 request["id"] = jsonrpc::request_id_to_json(bridge_id);
 
                 // RAII Guard: Automatically calls cleanup(id) when this object goes out of scope
@@ -188,6 +188,7 @@ net::awaitable<void> handle_local_session(
         }
     } catch (...) { 
         /* Handle disconnect */ 
+        close_socket_if_open(socket_ptr);
         session_manager->unregister_socket(socket_ptr);
     }
 }
@@ -214,19 +215,18 @@ net::awaitable<void> remote_reader(
             }
             
             if (is_json) {
-                // If it has an id, it's a response to a specific request
-                if (response.contains("id")) {
+                if (jsonrpc::is_valid_jsonrpc_response(response)) {
                     auto maybe_id = jsonrpc::request_id_from_json(response["id"]);
-                    if (maybe_id.has_value()) {
+                    if (maybe_id.has_value() && jsonrpc::is_trackable_request_id(*maybe_id)) {
                         response_manager->store_response(*maybe_id, response);
                     }
-                } else {
-                    // Otherwise broadcast as notification to all local sessions
+                } else if (jsonrpc::is_valid_jsonrpc_notification(response)) {
                     co_await session_manager->broadcast(message);
+                } else {
+                    fprintf(stderr, "Invalid JSON-RPC message from Go backend ignored: %s\n", message.c_str());
                 }
             } else {
-                // If not JSON, print error and move on
-                fprintf(stderr, "Received non-JSON message from Go backend: %s\n", message.c_str());
+                fprintf(stderr, "Non-JSON backend message ignored: %s\n", message.c_str());
             }
         }
     } catch (std::exception& e) {

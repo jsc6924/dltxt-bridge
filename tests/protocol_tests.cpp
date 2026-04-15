@@ -109,6 +109,18 @@ void test_socket_helpers_identify_and_prune_dead_sockets() {
     assert(sockets.front().get() == live_socket.get());
 }
 
+void test_close_socket_if_open_closes_socket() {
+    net::io_context ioc;
+    auto socket = std::make_shared<tcp::socket>(ioc);
+    socket->open(tcp::v4());
+
+    assert(socket->is_open());
+
+    close_socket_if_open(socket);
+
+    assert(!socket->is_open());
+}
+
 void test_jsonrpc_helpers() {
     const json response = jsonrpc::create_response(1, json{{"ok", true}});
     assert(response["jsonrpc"] == "2.0");
@@ -129,13 +141,34 @@ void test_jsonrpc_helpers() {
 
     const auto invalid_id = jsonrpc::request_id_from_json(3.14);
     assert(!invalid_id.has_value());
+
+    const auto null_id = jsonrpc::request_id_from_json(nullptr);
+    assert(null_id.has_value());
+    assert(!jsonrpc::is_trackable_request_id(*null_id));
+}
+
+void test_jsonrpc_response_validation() {
+    const json valid_response = json{{"jsonrpc", "2.0"}, {"id", 1}, {"result", json{{"ok", true}}}};
+    assert(jsonrpc::is_valid_jsonrpc_response(valid_response));
+
+    const json invalid_response_missing_result = json{{"jsonrpc", "2.0"}, {"id", 1}};
+    assert(!jsonrpc::is_valid_jsonrpc_response(invalid_response_missing_result));
+
+    const json invalid_response_with_method = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "notify"}};
+    assert(!jsonrpc::is_valid_jsonrpc_response(invalid_response_with_method));
+
+    const json valid_notification = json{{"jsonrpc", "2.0"}, {"method", "notify"}, {"params", json::object()}};
+    assert(jsonrpc::is_valid_jsonrpc_notification(valid_notification));
+
+    const json invalid_notification_with_id = json{{"jsonrpc", "2.0"}, {"method", "notify"}, {"id", 1}};
+    assert(!jsonrpc::is_valid_jsonrpc_notification(invalid_notification_with_id));
 }
 
 void test_response_manager_round_trip() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId original_id = std::string{"req-1"};
-    const RequestId bridge_id = manager->create_request_tracker(original_id, ioc.get_executor());
+    const RequestId bridge_id = manager->create_bridge_request_id(original_id, ioc.get_executor());
 
     std::optional<ResponseManager::WaitResult> result;
 
@@ -163,7 +196,7 @@ void test_response_manager_integer_id_round_trip() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId original_id = std::int64_t{17};
-    const RequestId bridge_id = manager->create_request_tracker(original_id, ioc.get_executor());
+    const RequestId bridge_id = manager->create_bridge_request_id(original_id, ioc.get_executor());
 
     std::optional<ResponseManager::WaitResult> result;
 
@@ -190,8 +223,8 @@ void test_response_manager_allows_duplicate_original_ids() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId original_id = std::int64_t{42};
-    const RequestId bridge_id_a = manager->create_request_tracker(original_id, ioc.get_executor());
-    const RequestId bridge_id_b = manager->create_request_tracker(original_id, ioc.get_executor());
+    const RequestId bridge_id_a = manager->create_bridge_request_id(original_id, ioc.get_executor());
+    const RequestId bridge_id_b = manager->create_bridge_request_id(original_id, ioc.get_executor());
 
     assert(bridge_id_a != bridge_id_b);
 
@@ -234,11 +267,25 @@ void test_response_manager_allows_duplicate_original_ids() {
     assert((*result_b->response)["result"]["which"] == "b");
 }
 
+void test_response_manager_rejects_null_original_ids() {
+    net::io_context ioc;
+    auto manager = std::make_shared<ResponseManager>();
+    bool threw = false;
+
+    try {
+        static_cast<void>(manager->create_bridge_request_id(RequestId{std::monostate{}}, ioc.get_executor()));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+
+    assert(threw);
+}
+
 void test_response_manager_cancel_all_releases_waiters() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId id = std::string{"req-cancel"};
-    const RequestId bridge_id = manager->create_request_tracker(id, ioc.get_executor());
+    const RequestId bridge_id = manager->create_bridge_request_id(id, ioc.get_executor());
 
     std::optional<ResponseManager::WaitResult> result;
 
@@ -266,7 +313,7 @@ void test_response_manager_times_out_waiters() {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();
     const RequestId id = std::string{"req-timeout"};
-    const RequestId bridge_id = manager->create_request_tracker(id, ioc.get_executor(), 20ms);
+    const RequestId bridge_id = manager->create_bridge_request_id(id, ioc.get_executor(), 20ms);
 
     std::optional<ResponseManager::WaitResult> result;
 
@@ -350,7 +397,7 @@ void test_remote_retry_loop_cancels_pending_responses_after_disconnect() {
     std::optional<ResponseManager::WaitResult> result;
     int error_count = 0;
 
-    const RequestId bridge_id = response_manager->create_request_tracker(id, ioc.get_executor());
+    const RequestId bridge_id = response_manager->create_bridge_request_id(id, ioc.get_executor());
 
     net::co_spawn(ioc,
         [response_manager, &result, bridge_id]() -> net::awaitable<void> {
@@ -438,10 +485,12 @@ int main() {
     test_parse_bridge_settings_rejects_invalid_port();
     test_bridge_signal_numbers_include_shutdown_signals();
     test_socket_helpers_identify_and_prune_dead_sockets();
+    test_close_socket_if_open_closes_socket();
     test_jsonrpc_helpers();
     test_response_manager_round_trip();
     test_response_manager_integer_id_round_trip();
     test_response_manager_allows_duplicate_original_ids();
+    test_response_manager_rejects_null_original_ids();
     test_response_manager_cancel_all_releases_waiters();
     test_response_manager_times_out_waiters();
     test_remote_retry_loop_retries_with_fresh_remote_instances();

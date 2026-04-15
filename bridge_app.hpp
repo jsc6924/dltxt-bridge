@@ -47,6 +47,16 @@ inline bool socket_is_dead(const std::shared_ptr<tcp::socket>& socket) {
     return !socket || !socket->is_open();
 }
 
+inline void close_socket_if_open(const std::shared_ptr<tcp::socket>& socket) {
+    if (!socket || !socket->is_open()) {
+        return;
+    }
+
+    boost::system::error_code error;
+    socket->shutdown(tcp::socket::shutdown_both, error);
+    socket->close(error);
+}
+
 inline void erase_sockets_by_identity(
     std::vector<std::shared_ptr<tcp::socket>>& sockets,
     const std::vector<std::shared_ptr<tcp::socket>>& dead_sockets) {
