@@ -14,10 +14,22 @@ endif()
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(nlohmann_json CONFIG REQUIRED)
 
+enable_testing()
+
 add_executable(dltxt_bridge main.cpp)
+
+add_executable(dltxt_bridge_tests tests/protocol_tests.cpp)
 
 target_link_libraries(dltxt_bridge PRIVATE 
     Boost::headers
     Boost::system
     nlohmann_json::nlohmann_json
 )
+
+target_link_libraries(dltxt_bridge_tests PRIVATE 
+  Boost::headers
+  Boost::system
+  nlohmann_json::nlohmann_json
+)
+
+add_test(NAME dltxt_bridge_tests COMMAND dltxt_bridge_tests)

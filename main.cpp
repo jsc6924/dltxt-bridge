@@ -1,121 +1,28 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
+#include "bridge_protocol.hpp"
 #include <cstdio>
-#include <nlohmann/json.hpp>
 #include <string>
 #include <memory>
 #include <vector>
-#include <mutex>
-#include <map>
 #include <deque>
-#include <condition_variable>
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
 using tcp = net::ip::tcp;
-using json = nlohmann::json;
 namespace websocket = beast::websocket;
-
-// JSON-RPC utilities
-namespace jsonrpc {
-    json create_response(const json& id, const json& result) {
-        return json{
-            {"jsonrpc", "2.0"},
-            {"id", id},
-            {"result", result}
-        };
-    }
-
-    json create_error(const json& id, int code, const std::string& message) {
-        return json{
-            {"jsonrpc", "2.0"},
-            {"id", id},
-            {"error", json{{"code", code}, {"message", message}}}
-        };
-    }
-
-    json create_notification(const std::string& method, const json& params = json::object()) {
-        return json{
-            {"jsonrpc", "2.0"},
-            {"method", method},
-            {"params", params}
-        };
-    }
-}
-class ResponseManager {
-private:
-    struct Tracker {
-        std::deque<json> responses;
-        std::unique_ptr<net::steady_timer> signal;
-    };
-    std::map<json, std::shared_ptr<Tracker>> pending_responses_;
-    std::mutex mutex_;
-
-public:
-    std::shared_ptr<Tracker> create_request_tracker(const json& id, net::any_io_executor ex) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto tracker = std::make_shared<Tracker>();
-        // Create a timer that essentially never expires
-        tracker->signal = std::make_unique<net::steady_timer>(ex, std::chrono::steady_clock::time_point::max());
-        pending_responses_[id] = tracker;
-        return tracker;
-    }
-
-    // New helper to hide the "ugly" timer logic
-    net::awaitable<std::optional<json>> wait_for_response(json id) {
-        std::shared_ptr<Tracker> tracker;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            tracker = pending_responses_[id];
-        }
-
-        if (tracker) {
-            // Wait without throwing exceptions
-            co_await tracker->signal->async_wait(net::as_tuple(net::use_awaitable));
-            
-            if (!tracker->responses.empty()) {
-                co_return std::move(tracker->responses.front());
-            }
-        }
-        co_return std::nullopt; // Or handle timeout/error
-    }
-
-    void store_response(const json& id, const json& response) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = pending_responses_.find(id);
-        if (it != pending_responses_.end()) {
-            it->second->responses.push_back(response);
-            // This is the "Signal": cancelling the timer wakes up the co_await
-            it->second->signal->cancel();
-        }
-    }
-
-    void cleanup(const json& id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pending_responses_.erase(id);
-    }
-};
-
-struct ResponseCleanup {
-    std::shared_ptr<ResponseManager> manager;
-    json id;
-    ~ResponseCleanup() { manager->cleanup(id); }
-};
 
 class LocalSessionManager {
 private:
     std::vector<std::shared_ptr<tcp::socket>> sockets_;
-    std::mutex mutex_;
 
 public:
     void register_socket(std::shared_ptr<tcp::socket> socket) {
-        std::lock_guard<std::mutex> lock(mutex_);
         sockets_.push_back(socket);
     }
 
     void unregister_socket(std::shared_ptr<tcp::socket> socket) {
-        std::lock_guard<std::mutex> lock(mutex_);
         sockets_.erase(
             std::remove_if(sockets_.begin(), sockets_.end(),
                 [socket](const std::shared_ptr<tcp::socket>& s) {
@@ -126,19 +33,13 @@ public:
     }
 
     net::awaitable<void> broadcast(std::string message) {
-        std::vector<std::shared_ptr<tcp::socket>> sockets_copy;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            sockets_copy = sockets_;
-        }
+        std::vector<std::shared_ptr<tcp::socket>> sockets_copy = sockets_;
+        std::string framed_message = lsp::frame_message(message);
         
         for (auto& socket : sockets_copy) {
             if (socket && socket->is_open()) {
                 try {
-                    co_await socket->async_write_some(
-                        net::buffer(message),
-                        net::use_awaitable
-                    );
+                    co_await net::async_write(*socket, net::buffer(framed_message), net::use_awaitable);
                 } catch (...) {
                     // Socket may be closed, skip
                 }
@@ -148,14 +49,20 @@ public:
 };
 
 class RemoteClient {
+    net::strand<net::any_io_executor> strand_;
     websocket::stream<beast::tcp_stream> ws_;
-    std::mutex ws_mutex_;  // Protect concurrent access to WebSocket
+    std::deque<std::string> write_queue_;
+    bool write_in_progress_ = false;
 
 public:
-    explicit RemoteClient(net::any_io_executor ex) : ws_(ex) {}
+    explicit RemoteClient(net::any_io_executor ex)
+        : strand_(net::make_strand(ex)),
+          ws_(strand_) {}
 
     net::awaitable<void> connect(std::string host, std::string port) {
-        tcp::resolver resolver(ws_.get_executor());
+        co_await net::dispatch(strand_, net::use_awaitable);
+
+        tcp::resolver resolver(strand_);
         auto const results = co_await resolver.async_resolve(host, port, net::use_awaitable);
 
         // Connect and Handshake
@@ -170,12 +77,35 @@ public:
     }
 
     net::awaitable<void> send(std::string message) {
-        printf("Sending to Go backend: %s\n", message.c_str());
-        co_await ws_.async_write(net::buffer(message), net::use_awaitable);
-        printf("Message sent to Go backend\n");
+        co_await net::dispatch(strand_, net::use_awaitable);
+
+        write_queue_.push_back(std::move(message));
+        if (write_in_progress_) {
+            co_return;
+        }
+
+        write_in_progress_ = true;
+
+        try {
+            while (!write_queue_.empty()) {
+                std::string next = std::move(write_queue_.front());
+                write_queue_.pop_front();
+
+                printf("Sending to Go backend: %s\n", next.c_str());
+                co_await ws_.async_write(net::buffer(next), net::use_awaitable);
+                printf("Message sent to Go backend\n");
+            }
+        } catch (...) {
+            write_in_progress_ = false;
+            throw;
+        }
+
+        write_in_progress_ = false;
     }
 
     net::awaitable<std::string> receive() {
+        co_await net::dispatch(strand_, net::use_awaitable);
+
         beast::flat_buffer buffer;
         co_await ws_.async_read(buffer, net::use_awaitable);
         co_return beast::buffers_to_string(buffer.data());
@@ -195,18 +125,16 @@ net::awaitable<void> handle_local_session(
     
     try {
         for (;;) {
-            // 1. Read until newline
-            std::size_t n = co_await net::async_read_until(*socket_ptr, buffer, '\n', net::use_awaitable);
-            
-            // 2. Extract ONLY the message part
-            auto data = buffer.data();
-            std::string msg_str = beast::buffers_to_string(beast::buffers_prefix(n, data));
-            // 3. Consume only what we processed (preserving the rest!)
-            buffer.consume(n);
-            if (!msg_str.empty() && msg_str.back() == '\n') {
-                msg_str.pop_back();
+            auto maybe_message = co_await lsp::read_message(*socket_ptr, buffer);
+            if (!maybe_message.has_value()) {
+                fprintf(stderr, "Invalid LSP header received\n");
+                continue;
             }
-            if (msg_str.empty()) continue;
+
+            std::string msg_str = std::move(*maybe_message);
+            if (msg_str.empty()) {
+                continue;
+            }
             
             // Parse JSON-RPC
             bool parse_error = false;
@@ -225,9 +153,8 @@ net::awaitable<void> handle_local_session(
             if (!request.contains("jsonrpc") || request["jsonrpc"] != "2.0") {
                 if (request.contains("id")) {
                     json error_resp = jsonrpc::create_error(request["id"], -32600, "Invalid Request");
-                    co_await socket_ptr->async_write_some(
-                        net::buffer(error_resp.dump() + "\n"), 
-                        net::use_awaitable);
+                    std::string framed = lsp::frame_message(error_resp.dump());
+                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
                 }
                 continue;
             }
@@ -235,17 +162,14 @@ net::awaitable<void> handle_local_session(
             if (!request.contains("method")) {
                 if (request.contains("id")) {
                     json error_resp = jsonrpc::create_error(request["id"], -32600, "Missing method");
-                    co_await socket_ptr->async_write_some(
-                        net::buffer(error_resp.dump() + "\n"), 
-                        net::use_awaitable);
+                    std::string framed = lsp::frame_message(error_resp.dump());
+                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
                 }
                 continue;
             }
             
             printf("JSON-RPC Request: %s\n", request.dump().c_str());
             
-            // Forward to Go backend
-            co_await remote->send(request.dump());
             
             if (request.contains("id")) {
                 auto id = request["id"];
@@ -261,9 +185,10 @@ net::awaitable<void> handle_local_session(
                 auto maybe_response = co_await response_manager->wait_for_response(id);
 
                 if (maybe_response.has_value()) {
-                    json real_response = maybe_response.value();
-                    co_await socket_ptr->async_write_some(
-                        net::buffer(real_response.dump() + "\n"), 
+                    std::string out = lsp::frame_message(maybe_response->dump());
+                    co_await net::async_write(
+                        *socket_ptr, 
+                        net::buffer(out), 
                         net::use_awaitable
                     );
                 }
@@ -305,11 +230,11 @@ net::awaitable<void> remote_reader(
                     response_manager->store_response(response["id"], response);
                 } else {
                     // Otherwise broadcast as notification to all local sessions
-                    co_await session_manager->broadcast(message + "\n");
+                    co_await session_manager->broadcast(message);
                 }
             } else {
                 // If not JSON, just broadcast
-                co_await session_manager->broadcast(message + "\n");
+                co_await session_manager->broadcast(message);
             }
         }
     } catch (std::exception& e) {
