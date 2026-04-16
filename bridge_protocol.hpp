@@ -199,6 +199,40 @@ inline json create_notification(const std::string& method, const json& params = 
 }
 }
 
+namespace bridge_local {
+struct RequestHandlingResult {
+    bool forward_to_remote = false;
+    std::optional<json> response;
+};
+
+inline RequestHandlingResult handle_request(const json& request) {
+    if (!request.is_object() || !request.contains("method") || !request["method"].is_string()) {
+        return {};
+    }
+
+    const std::string method = request["method"].get<std::string>();
+    if (method.rfind("simpletm/", 0) == 0) {
+        return RequestHandlingResult{true, std::nullopt};
+    }
+
+    if (!request.contains("id")) {
+        return {};
+    }
+
+    if (method == "initialize") {
+        return RequestHandlingResult{
+            false,
+            jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}})
+        };
+    }
+
+    return RequestHandlingResult{
+        false,
+        jsonrpc::create_error(request["id"], -32601, "method " + method + " is not recognized")
+    };
+}
+}
+
 class ResponseManager {
 private:
     struct Tracker {

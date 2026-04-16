@@ -77,6 +77,15 @@ public:
     }
 };
 
+net::awaitable<void> write_json_message(tcp::socket& socket, const json& message) {
+    std::string framed = lsp::frame_message(message.dump());
+    co_await net::async_write(socket, net::buffer(framed), net::use_awaitable);
+}
+
+net::awaitable<void> write_json_error(tcp::socket& socket, const json& id, int code, const std::string& message) {
+    co_await write_json_message(socket, jsonrpc::create_error(id, code, message));
+}
+
 net::awaitable<void> handle_local_session(
     tcp::socket socket, 
     std::shared_ptr<RemoteRegistry> remote_registry,
@@ -118,30 +127,32 @@ net::awaitable<void> handle_local_session(
             // Validate JSON-RPC request
             if (!request.contains("jsonrpc") || request["jsonrpc"] != "2.0") {
                 if (request.contains("id")) {
-                    json error_resp = jsonrpc::create_error(request["id"], -32600, "Invalid Request");
-                    std::string framed = lsp::frame_message(error_resp.dump());
-                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                    co_await write_json_error(*socket_ptr, request["id"], -32600, "Invalid Request");
                 }
                 continue;
             }
             
             if (!request.contains("method")) {
                 if (request.contains("id")) {
-                    json error_resp = jsonrpc::create_error(request["id"], -32600, "Missing method");
-                    std::string framed = lsp::frame_message(error_resp.dump());
-                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                    co_await write_json_error(*socket_ptr, request["id"], -32600, "Missing method");
                 }
                 continue;
             }
             
             printf("JSON-RPC Request: %s\n", request.dump().c_str());
+
+            auto local_handling = bridge_local::handle_request(request);
+            if (!local_handling.forward_to_remote) {
+                if (local_handling.response.has_value()) {
+                    co_await write_json_message(*socket_ptr, *local_handling.response);
+                }
+                continue;
+            }
             
             auto remote = remote_registry->get();
             if (!remote) {
                 if (request.contains("id")) {
-                    json error_resp = jsonrpc::create_error(request["id"], -32000, "Remote server unavailable");
-                    std::string framed = lsp::frame_message(error_resp.dump());
-                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                    co_await write_json_error(*socket_ptr, request["id"], -32000, "Remote server unavailable");
                 }
                 continue;
             }
@@ -149,9 +160,7 @@ net::awaitable<void> handle_local_session(
             if (request.contains("id")) {
                 auto maybe_id = jsonrpc::request_id_from_json(request["id"]);
                 if (!maybe_id.has_value() || !jsonrpc::is_trackable_request_id(*maybe_id)) {
-                    json error_resp = jsonrpc::create_error(request["id"], -32600, "Invalid Request id");
-                    std::string framed = lsp::frame_message(error_resp.dump());
-                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                    co_await write_json_error(*socket_ptr, request["id"], -32600, "Invalid Request id");
                     continue;
                 }
 
@@ -170,20 +179,11 @@ net::awaitable<void> handle_local_session(
                 auto wait_result = co_await response_manager->wait_for_response(bridge_id);
 
                 if (wait_result.status == ResponseManager::WaitStatus::response_ready && wait_result.response.has_value()) {
-                    std::string out = lsp::frame_message(wait_result.response->dump());
-                    co_await net::async_write(
-                        *socket_ptr, 
-                        net::buffer(out), 
-                        net::use_awaitable
-                    );
+                    co_await write_json_message(*socket_ptr, *wait_result.response);
                 } else if (wait_result.status == ResponseManager::WaitStatus::timed_out) {
-                    json error_resp = jsonrpc::create_error(original_id_json, -32001, "Request timed out");
-                    std::string framed = lsp::frame_message(error_resp.dump());
-                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                    co_await write_json_error(*socket_ptr, original_id_json, -32001, "Request timed out");
                 } else if (wait_result.status == ResponseManager::WaitStatus::cancelled) {
-                    json error_resp = jsonrpc::create_error(original_id_json, -32002, "Remote server disconnected while awaiting response");
-                    std::string framed = lsp::frame_message(error_resp.dump());
-                    co_await net::async_write(*socket_ptr, net::buffer(framed), net::use_awaitable);
+                    co_await write_json_error(*socket_ptr, original_id_json, -32002, "Remote server disconnected while awaiting response");
                 }
             } else {
                 // It's a notification, just fire and forget

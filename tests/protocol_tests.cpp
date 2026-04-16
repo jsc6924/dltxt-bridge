@@ -189,6 +189,44 @@ DEFINE_TEST(test_jsonrpc_response_validation) {
     assert(!jsonrpc::is_valid_jsonrpc_notification(invalid_notification_with_id));
 }
 
+DEFINE_TEST(test_local_initialize_request_returns_empty_capabilities) {
+    const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"}, {"params", json::object()}};
+    const auto handling = bridge_local::handle_request(request);
+
+    assert(!handling.forward_to_remote);
+    assert(handling.response.has_value());
+    assert((*handling.response)["jsonrpc"] == "2.0");
+    assert((*handling.response)["id"] == 1);
+    assert((*handling.response)["result"].is_object());
+    assert((*handling.response)["result"]["capabilities"] == json::object());
+}
+
+DEFINE_TEST(test_local_handler_rejects_unsupported_local_requests) {
+    const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "shutdown"}};
+    const auto handling = bridge_local::handle_request(request);
+
+    assert(!handling.forward_to_remote);
+    assert(handling.response.has_value());
+    assert((*handling.response)["error"]["code"] == -32601);
+    assert((*handling.response)["error"]["message"] == "method shutdown is not recognized");
+}
+
+DEFINE_TEST(test_local_handler_forwards_simpletm_requests) {
+    const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "simpletm/complete"}};
+    const auto handling = bridge_local::handle_request(request);
+
+    assert(handling.forward_to_remote);
+    assert(!handling.response.has_value());
+}
+
+DEFINE_TEST(test_local_handler_swallows_non_simpletm_notifications) {
+    const json request = json{{"jsonrpc", "2.0"}, {"method", "initialized"}};
+    const auto handling = bridge_local::handle_request(request);
+
+    assert(!handling.forward_to_remote);
+    assert(!handling.response.has_value());
+}
+
 DEFINE_TEST(test_response_manager_round_trip) {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();

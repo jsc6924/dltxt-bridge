@@ -20,6 +20,10 @@ add_executable(dltxt_bridge main.cpp)
 
 add_executable(dltxt_bridge_tests tests/protocol_tests.cpp)
 
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_tests.cpp
+)
+
 target_link_libraries(dltxt_bridge PRIVATE 
     Boost::headers
     Boost::system
