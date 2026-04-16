@@ -2,6 +2,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <array>
 #include <algorithm>
 #include <cctype>
 #include <limits>
@@ -27,6 +28,94 @@ inline constexpr std::size_t max_content_length = 10U * 1024U * 1024U;
 
 inline std::string frame_message(const std::string& payload) {
     return "Content-Length: " + std::to_string(payload.size()) + "\r\n\r\n" + payload;
+}
+
+inline bool is_ignorable_header_block(const std::string& header_block) {
+    return !header_block.empty() && std::all_of(header_block.begin(), header_block.end(),
+        [](unsigned char ch) {
+            return ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t';
+        });
+}
+
+inline std::string escape_control_chars(const std::string& text) {
+    std::string escaped;
+    escaped.reserve(text.size() * 4U);
+
+    constexpr char hex_digits[] = "0123456789ABCDEF";
+
+    for (unsigned char ch : text) {
+        switch (ch) {
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            if (std::isprint(ch)) {
+                escaped.push_back(static_cast<char>(ch));
+            } else {
+                escaped += "\\x";
+                escaped.push_back(hex_digits[(ch >> 4) & 0x0F]);
+                escaped.push_back(hex_digits[ch & 0x0F]);
+            }
+            break;
+        }
+    }
+
+    return escaped;
+}
+
+template <typename ConstBufferSequence>
+inline std::optional<std::size_t> header_block_length(const ConstBufferSequence& buffers) {
+    const std::string buffered = beast::buffers_to_string(buffers);
+    const std::size_t delimiter_pos = buffered.find("\r\n\r\n");
+    if (delimiter_pos == std::string::npos) {
+        return std::nullopt;
+    }
+
+    return delimiter_pos + 4;
+}
+
+template <typename ConstBufferSequence>
+inline void log_buffer_snapshot(const char* label, const ConstBufferSequence& buffers) {
+    const std::string buffered = beast::buffers_to_string(buffers);
+    const std::string escaped = escape_control_chars(buffered);
+    printf("%s (%zu bytes, escaped): [%s]\n", label, buffered.size(), escaped.c_str());
+}
+
+inline void append_chunk_to_buffer(beast::flat_buffer& buffer, const char* data, std::size_t size) {
+    auto prepared = buffer.prepare(size);
+    net::buffer_copy(prepared, net::buffer(data, size));
+    buffer.commit(size);
+}
+
+template <typename AsyncReadStream>
+net::awaitable<std::size_t> read_chunk(
+    AsyncReadStream& stream,
+    beast::flat_buffer& buffer) {
+
+    std::array<char, 4096> chunk{};
+    auto [error, bytes_read] = co_await stream.async_read_some(
+        net::buffer(chunk),
+        net::as_tuple(net::use_awaitable)
+    );
+
+    if (error) {
+        printf("%s\n", error.message().c_str());
+        throw boost::system::system_error(error);
+    }
+
+    if (bytes_read == 0) {
+        printf("Read returned 0 bytes\n");
+        co_return 0;
+    }
+
+    append_chunk_to_buffer(buffer, chunk.data(), bytes_read);
+    co_return bytes_read;
 }
 
 inline std::optional<std::size_t> parse_content_length(const std::string& headers) {
@@ -75,23 +164,59 @@ inline std::optional<std::size_t> parse_content_length(const std::string& header
 
 template <typename AsyncReadStream>
 net::awaitable<std::optional<std::string>> read_message(AsyncReadStream& stream, beast::flat_buffer& buffer) {
-    std::size_t header_bytes = co_await net::async_read_until(stream, buffer, "\r\n\r\n", net::use_awaitable);
+    for (;;) {
+        while (!header_block_length(buffer.data()).has_value()) {
+            const auto bytes_read = co_await read_chunk(
+                stream,
+                buffer
+            );
 
-    std::string header_block = beast::buffers_to_string(beast::buffers_prefix(header_bytes, buffer.data()));
-    buffer.consume(header_bytes);
+            if (bytes_read == 0) {
+                co_return std::nullopt;
+            }
+        }
 
-    auto content_length = parse_content_length(header_block);
-    if (!content_length.has_value()) {
-        co_return std::nullopt;
+        const auto header_bytes = header_block_length(buffer.data());
+        if (!header_bytes.has_value()) {
+            log_buffer_snapshot("Unable to find header delimiter in buffered bytes", buffer.data());
+            co_return std::nullopt;
+        }
+
+        std::string header_block = beast::buffers_to_string(beast::buffers_prefix(*header_bytes, buffer.data()));
+        buffer.consume(*header_bytes);
+
+        const std::string escaped_header = escape_control_chars(header_block);
+
+        if (is_ignorable_header_block(header_block)) {
+            printf("Ignoring blank header block\n");
+            continue;
+        }
+
+        auto content_length = parse_content_length(header_block);
+        if (!content_length.has_value()) {
+            printf("Invalid header block, unable to parse Content-Length\n");
+            co_return std::nullopt;
+        }
+
+        printf("Parsed Content-Length: %zu\n", *content_length);
+
+        while (buffer.size() < *content_length) {
+            const auto bytes_read = co_await read_chunk(
+                stream,
+                buffer
+            );
+
+            if (bytes_read == 0) {
+                co_return std::nullopt;
+            }
+        }
+
+        std::string payload = beast::buffers_to_string(beast::buffers_prefix(*content_length, buffer.data()));
+        printf("Received payload (%zu bytes):\n%s\n", payload.size(), payload.c_str());
+        buffer.consume(*content_length);
+        
+        co_return payload;
     }
-
-    while (buffer.size() < *content_length) {
-        co_await net::async_read(stream, buffer, net::transfer_at_least(*content_length - buffer.size()), net::use_awaitable);
-    }
-
-    std::string payload = beast::buffers_to_string(beast::buffers_prefix(*content_length, buffer.data()));
-    buffer.consume(*content_length);
-    co_return payload;
 }
 }
 
@@ -220,6 +345,7 @@ inline RequestHandlingResult handle_request(const json& request) {
     }
 
     if (method == "initialize") {
+        printf("Handled initialize request %s locally\n", request["id"].dump().c_str());
         return RequestHandlingResult{
             false,
             jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}})

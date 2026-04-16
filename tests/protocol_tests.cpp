@@ -46,6 +46,33 @@ DEFINE_TEST(test_frame_message) {
     assert(framed.substr(expected_prefix.size()) == payload);
 }
 
+DEFINE_TEST(test_is_ignorable_header_block) {
+    assert(lsp::is_ignorable_header_block("\r\n\r\n"));
+    assert(lsp::is_ignorable_header_block(" \t\r\n\r\n"));
+    assert(!lsp::is_ignorable_header_block(""));
+    assert(!lsp::is_ignorable_header_block("Content-Length: 10\r\n\r\n"));
+}
+
+DEFINE_TEST(test_escape_control_chars) {
+    const std::string escaped = lsp::escape_control_chars("Content-Length: 10\r\n\tX\r\n\r\n");
+    assert(escaped == "Content-Length: 10\\r\\n\\tX\\r\\n\\r\\n");
+}
+
+DEFINE_TEST(test_escape_control_chars_hex_escapes_non_printable_bytes) {
+    const std::string escaped = lsp::escape_control_chars(std::string{"A\0B", 3});
+    assert(escaped == "A\\x00B");
+}
+
+DEFINE_TEST(test_header_block_length_finds_complete_header_in_buffer) {
+    beast::flat_buffer buffer;
+    const std::string framed = "Content-Length: 2\r\n\r\n{}trailing";
+    buffer.commit(net::buffer_copy(buffer.prepare(framed.size()), net::buffer(framed)));
+
+    const auto header_length = lsp::header_block_length(buffer.data());
+    assert(header_length.has_value());
+    assert(*header_length == std::string{"Content-Length: 2\r\n\r\n"}.size());
+}
+
 DEFINE_TEST(test_parse_content_length_with_crlf) {
     const std::string headers = "Content-Length: 123\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n";
     const auto parsed = lsp::parse_content_length(headers);

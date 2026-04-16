@@ -94,7 +94,15 @@ net::awaitable<void> handle_local_session(
     std::chrono::milliseconds request_timeout) {
     
     auto socket_ptr = std::make_shared<tcp::socket>(std::move(socket));
+    boost::system::error_code endpoint_error;
+    const auto remote_endpoint = socket_ptr->remote_endpoint(endpoint_error);
     session_manager->register_socket(socket_ptr);
+
+    if (!endpoint_error) {
+        printf("Accepted local client %s:%u\n", remote_endpoint.address().to_string().c_str(), remote_endpoint.port());
+    } else {
+        fprintf(stderr, "Accepted local client with unknown endpoint: %s\n", endpoint_error.message().c_str());
+    }
     
     beast::flat_buffer buffer;
     
@@ -192,6 +200,9 @@ net::awaitable<void> handle_local_session(
         }
     } catch (...) { 
         /* Handle disconnect */ 
+        if (!endpoint_error) {
+            printf("Closing local client %s:%u\n", remote_endpoint.address().to_string().c_str(), remote_endpoint.port());
+        }
         close_socket_if_open(socket_ptr);
         session_manager->unregister_socket(socket_ptr);
     }
