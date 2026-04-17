@@ -93,6 +93,10 @@ inline void append_chunk_to_buffer(beast::flat_buffer& buffer, const char* data,
     buffer.commit(size);
 }
 
+inline void log_local_notification(const std::string& method, const json& params = json::object()) {
+    printf("Handled local notification %s: %s\n", method.c_str(), params.dump().c_str());
+}
+
 template <typename AsyncReadStream>
 net::awaitable<std::size_t> read_chunk(
     AsyncReadStream& stream,
@@ -325,9 +329,16 @@ inline json create_notification(const std::string& method, const json& params = 
 }
 
 namespace bridge_local {
+enum class SessionDirective {
+    none,
+    mark_shutdown_requested,
+    close_session,
+};
+
 struct RequestHandlingResult {
     bool forward_to_remote = false;
     std::optional<json> response;
+    SessionDirective directive = SessionDirective::none;
 };
 
 inline RequestHandlingResult handle_request(const json& request) {
@@ -340,6 +351,37 @@ inline RequestHandlingResult handle_request(const json& request) {
         return RequestHandlingResult{true, std::nullopt};
     }
 
+    if (method == "initialized") {
+        lsp::log_local_notification(method, request.value("params", json::object()));
+        return {};
+    }
+
+    if (method == "$/setTrace") {
+        lsp::log_local_notification(method, request.value("params", json::object()));
+        return {};
+    }
+
+    if (method == "exit") {
+        lsp::log_local_notification(method, request.value("params", json::object()));
+        return RequestHandlingResult{false, std::nullopt, SessionDirective::close_session};
+    }
+
+    if (method == "dltxt/echo") {
+        if (!request.contains("id")) {
+            return {};
+        }
+
+        const json params = request.value("params", json::object());
+        const std::string message = params.value("message", "");
+        printf("Echoing message from client: %s\n", message.c_str());
+
+        return RequestHandlingResult{
+            false,
+            jsonrpc::create_response(request["id"], json{{"result", message}}),
+            SessionDirective::none
+        };
+    }
+
     if (!request.contains("id")) {
         return {};
     }
@@ -348,13 +390,24 @@ inline RequestHandlingResult handle_request(const json& request) {
         printf("Handled initialize request %s locally\n", request["id"].dump().c_str());
         return RequestHandlingResult{
             false,
-            jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}})
+            jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}}),
+            SessionDirective::none
+        };
+    }
+
+    if (method == "shutdown") {
+        printf("Handled shutdown request %s locally\n", request["id"].dump().c_str());
+        return RequestHandlingResult{
+            false,
+            jsonrpc::create_response(request["id"], nullptr),
+            SessionDirective::mark_shutdown_requested
         };
     }
 
     return RequestHandlingResult{
         false,
-        jsonrpc::create_error(request["id"], -32601, "method " + method + " is not recognized")
+        jsonrpc::create_error(request["id"], -32601, "method " + method + " is not recognized"),
+        SessionDirective::none
     };
 }
 }

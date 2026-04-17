@@ -228,14 +228,27 @@ DEFINE_TEST(test_local_initialize_request_returns_empty_capabilities) {
     assert((*handling.response)["result"]["capabilities"] == json::object());
 }
 
-DEFINE_TEST(test_local_handler_rejects_unsupported_local_requests) {
+DEFINE_TEST(test_local_handler_returns_shutdown_response) {
     const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "shutdown"}};
     const auto handling = bridge_local::handle_request(request);
 
     assert(!handling.forward_to_remote);
     assert(handling.response.has_value());
+    assert((*handling.response)["jsonrpc"] == "2.0");
+    assert((*handling.response)["id"] == 1);
+    assert((*handling.response)["result"].is_null());
+    assert(handling.directive == bridge_local::SessionDirective::mark_shutdown_requested);
+}
+
+DEFINE_TEST(test_local_handler_rejects_unsupported_local_requests) {
+    const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "textDocument/hover"}};
+    const auto handling = bridge_local::handle_request(request);
+
+    assert(!handling.forward_to_remote);
+    assert(handling.response.has_value());
     assert((*handling.response)["error"]["code"] == -32601);
-    assert((*handling.response)["error"]["message"] == "method shutdown is not recognized");
+    assert((*handling.response)["error"]["message"] == "method textDocument/hover is not recognized");
+    assert(handling.directive == bridge_local::SessionDirective::none);
 }
 
 DEFINE_TEST(test_local_handler_forwards_simpletm_requests) {
@@ -252,6 +265,23 @@ DEFINE_TEST(test_local_handler_swallows_non_simpletm_notifications) {
 
     assert(!handling.forward_to_remote);
     assert(!handling.response.has_value());
+}
+
+DEFINE_TEST(test_local_handler_swallows_set_trace_notification) {
+    const json request = json{{"jsonrpc", "2.0"}, {"method", "$/setTrace"}, {"params", json{{"value", "off"}}}};
+    const auto handling = bridge_local::handle_request(request);
+
+    assert(!handling.forward_to_remote);
+    assert(!handling.response.has_value());
+}
+
+DEFINE_TEST(test_local_handler_closes_session_on_exit_notification) {
+    const json request = json{{"jsonrpc", "2.0"}, {"method", "exit"}};
+    const auto handling = bridge_local::handle_request(request);
+
+    assert(!handling.forward_to_remote);
+    assert(!handling.response.has_value());
+    assert(handling.directive == bridge_local::SessionDirective::close_session);
 }
 
 DEFINE_TEST(test_response_manager_round_trip) {

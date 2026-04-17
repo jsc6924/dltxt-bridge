@@ -12,7 +12,8 @@
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 using RemoteRegistry = ActiveRemote<class RemoteClient>;
-
+net::awaitable<void> write_json_message(tcp::socket& socket, const json& message);
+net::awaitable<void> write_json_error(tcp::socket& socket, const json& id, int code, const std::string& message);
 class RemoteClient {
     net::strand<net::any_io_executor> strand_;
     websocket::stream<beast::tcp_stream> ws_;
@@ -77,7 +78,26 @@ public:
     }
 };
 
+net::awaitable<void> heartbeat_loop(tcp::socket& socket) {
+    try {
+        while (socket.is_open()) {
+            net::steady_timer timer(socket.get_executor());
+            timer.expires_after(std::chrono::seconds(10));
+            co_await timer.async_wait(net::use_awaitable);
+
+            if (!socket.is_open()) {
+                break;
+            }
+
+            co_await write_json_message(socket, jsonrpc::create_notification("dltxt/notification", {{"message", "heartbeat"}}));
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Heartbeat loop error: %s\n", e.what());
+    }
+}
+
 net::awaitable<void> write_json_message(tcp::socket& socket, const json& message) {
+    printf("[response] %s\n", message.dump().c_str());
     std::string framed = lsp::frame_message(message.dump());
     co_await net::async_write(socket, net::buffer(framed), net::use_awaitable);
 }
@@ -105,6 +125,9 @@ net::awaitable<void> handle_local_session(
     }
     
     beast::flat_buffer buffer;
+    bool shutdown_requested = false;
+
+    net::co_spawn(socket_ptr->get_executor(), heartbeat_loop(*socket_ptr), net::detached);
     
     try {
         for (;;) {
@@ -154,6 +177,20 @@ net::awaitable<void> handle_local_session(
                 if (local_handling.response.has_value()) {
                     co_await write_json_message(*socket_ptr, *local_handling.response);
                 }
+
+                if (local_handling.directive == bridge_local::SessionDirective::mark_shutdown_requested) {
+                    shutdown_requested = true;
+                } else if (local_handling.directive == bridge_local::SessionDirective::close_session) {
+                    printf(
+                        shutdown_requested
+                            ? "Closing local session after exit notification following shutdown\n"
+                            : "Closing local session after exit notification without prior shutdown\n"
+                    );
+                    close_socket_if_open(socket_ptr);
+                    session_manager->unregister_socket(socket_ptr);
+                    co_return;
+                }
+
                 continue;
             }
             
