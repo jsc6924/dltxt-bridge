@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "../local_session.hpp"
 #include "../bridge_app.hpp"
 #include "../bridge_protocol.hpp"
 #include "../bridge_runtime.hpp"
@@ -150,15 +151,42 @@ DEFINE_TEST(test_socket_helpers_identify_and_prune_dead_sockets) {
     live_socket->open(tcp::v4());
 
     auto dead_socket = std::make_shared<tcp::socket>(ioc);
-    std::vector<std::shared_ptr<tcp::socket>> sockets{live_socket, dead_socket};
+    std::vector<std::shared_ptr<LocalSession>> sessions{std::make_shared<LocalSession>(std::move(*live_socket)), std::make_shared<LocalSession>(std::move(*dead_socket))};
 
     assert(!socket_is_dead(live_socket));
     assert(socket_is_dead(dead_socket));
 
-    erase_sockets_by_identity(sockets, {dead_socket});
+    erase_sockets_by_identity(sessions, {dead_socket});
 
-    assert(sockets.size() == 1);
-    assert(sockets.front().get() == live_socket.get());
+    assert(sessions.size() == 1);
+    assert(sessions.front()->get_socket().get() == live_socket.get());
+}
+
+DEFINE_TEST(test_local_session_equality_compares_by_socket_identity) {
+    net::io_context ioc;
+
+    tcp::socket raw_a(ioc);
+    tcp::socket raw_b(ioc);
+
+    // Capture the raw pointer before the socket is moved into the session
+    const auto session_a = std::make_shared<LocalSession>(std::move(raw_a));
+    const auto session_b = std::make_shared<LocalSession>(std::move(raw_b));
+    const auto session_a_alias = session_a;
+
+    assert(*session_a == *session_a_alias);
+    assert(!(*session_a == *session_b));
+}
+
+DEFINE_TEST(test_local_session_manager_register_socket_preserves_shared_socket_identity) {
+    net::io_context ioc;
+    LocalSessionManager manager;
+    auto socket = std::make_shared<tcp::socket>(ioc);
+    socket->open(tcp::v4());
+
+    const auto session = manager.register_socket(socket);
+
+    assert(manager.session_count() == 1);
+    assert(session->get_socket() == socket);
 }
 
 DEFINE_TEST(test_close_socket_if_open_closes_socket) {
@@ -218,7 +246,7 @@ DEFINE_TEST(test_jsonrpc_response_validation) {
 
 DEFINE_TEST(test_local_initialize_request_returns_empty_capabilities) {
     const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"}, {"params", json::object()}};
-    const auto handling = bridge_local::handle_request(request);
+    const auto handling = bridge_local::handle_request(nullptr, request);
 
     assert(!handling.forward_to_remote);
     assert(handling.response.has_value());
@@ -230,7 +258,7 @@ DEFINE_TEST(test_local_initialize_request_returns_empty_capabilities) {
 
 DEFINE_TEST(test_local_handler_returns_shutdown_response) {
     const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "shutdown"}};
-    const auto handling = bridge_local::handle_request(request);
+    const auto handling = bridge_local::handle_request(nullptr, request);
 
     assert(!handling.forward_to_remote);
     assert(handling.response.has_value());
@@ -242,7 +270,7 @@ DEFINE_TEST(test_local_handler_returns_shutdown_response) {
 
 DEFINE_TEST(test_local_handler_rejects_unsupported_local_requests) {
     const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "textDocument/hover"}};
-    const auto handling = bridge_local::handle_request(request);
+    const auto handling = bridge_local::handle_request(nullptr, request);
 
     assert(!handling.forward_to_remote);
     assert(handling.response.has_value());
@@ -253,7 +281,7 @@ DEFINE_TEST(test_local_handler_rejects_unsupported_local_requests) {
 
 DEFINE_TEST(test_local_handler_forwards_simpletm_requests) {
     const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "simpletm/complete"}};
-    const auto handling = bridge_local::handle_request(request);
+    const auto handling = bridge_local::handle_request(nullptr, request);
 
     assert(handling.forward_to_remote);
     assert(!handling.response.has_value());
@@ -261,7 +289,7 @@ DEFINE_TEST(test_local_handler_forwards_simpletm_requests) {
 
 DEFINE_TEST(test_local_handler_swallows_non_simpletm_notifications) {
     const json request = json{{"jsonrpc", "2.0"}, {"method", "initialized"}};
-    const auto handling = bridge_local::handle_request(request);
+    const auto handling = bridge_local::handle_request(nullptr, request);
 
     assert(!handling.forward_to_remote);
     assert(!handling.response.has_value());
@@ -269,7 +297,7 @@ DEFINE_TEST(test_local_handler_swallows_non_simpletm_notifications) {
 
 DEFINE_TEST(test_local_handler_swallows_set_trace_notification) {
     const json request = json{{"jsonrpc", "2.0"}, {"method", "$/setTrace"}, {"params", json{{"value", "off"}}}};
-    const auto handling = bridge_local::handle_request(request);
+    const auto handling = bridge_local::handle_request(nullptr, request);
 
     assert(!handling.forward_to_remote);
     assert(!handling.response.has_value());
@@ -277,7 +305,7 @@ DEFINE_TEST(test_local_handler_swallows_set_trace_notification) {
 
 DEFINE_TEST(test_local_handler_closes_session_on_exit_notification) {
     const json request = json{{"jsonrpc", "2.0"}, {"method", "exit"}};
-    const auto handling = bridge_local::handle_request(request);
+    const auto handling = bridge_local::handle_request(nullptr, request);
 
     assert(!handling.forward_to_remote);
     assert(!handling.response.has_value());

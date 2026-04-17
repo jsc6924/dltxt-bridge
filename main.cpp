@@ -14,6 +14,57 @@ namespace websocket = beast::websocket;
 using RemoteRegistry = ActiveRemote<class RemoteClient>;
 net::awaitable<void> write_json_message(tcp::socket& socket, const json& message);
 net::awaitable<void> write_json_error(tcp::socket& socket, const json& id, int code, const std::string& message);
+
+class RemoteNotificationQueue {
+    net::steady_timer signal_;
+    std::deque<std::string> messages_;
+    bool closed_ = false;
+
+public:
+    explicit RemoteNotificationQueue(net::any_io_executor executor)
+        : signal_(executor) {
+        signal_.expires_at((std::chrono::steady_clock::time_point::max)());
+    }
+
+    void push(std::string message) {
+        if (closed_) {
+            return;
+        }
+
+        messages_.push_back(std::move(message));
+        signal_.cancel_one();
+    }
+
+    void close() {
+        if (closed_) {
+            return;
+        }
+
+        closed_ = true;
+        signal_.cancel();
+    }
+
+    net::awaitable<std::optional<std::string>> wait_and_pop() {
+        for (;;) {
+            if (!messages_.empty()) {
+                std::string message = std::move(messages_.front());
+                messages_.pop_front();
+                co_return message;
+            }
+
+            if (closed_) {
+                co_return std::nullopt;
+            }
+
+            signal_.expires_at((std::chrono::steady_clock::time_point::max)());
+            auto [error] = co_await signal_.async_wait(net::as_tuple(net::use_awaitable));
+            if (error && error != net::error::operation_aborted) {
+                throw boost::system::system_error(error);
+            }
+        }
+    }
+};
+
 class RemoteClient {
     net::strand<net::any_io_executor> strand_;
     websocket::stream<beast::tcp_stream> ws_;
@@ -96,6 +147,26 @@ net::awaitable<void> heartbeat_loop(tcp::socket& socket) {
     }
 }
 
+net::awaitable<void> remote_notification_forwarder(
+    std::shared_ptr<RemoteNotificationQueue> notification_queue,
+    std::shared_ptr<LocalSessionManager> session_manager) {
+
+    try {
+        for (;;) {
+            auto message = co_await notification_queue->wait_and_pop();
+            if (!message.has_value()) {
+                co_return;
+            }
+
+            printf("Forwarding remote notification to local clients: %s\n", message->c_str());
+            co_await session_manager->broadcast(*message);
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Remote notification forwarder error: %s\n", e.what());
+        throw;
+    }
+}
+
 net::awaitable<void> write_json_message(tcp::socket& socket, const json& message) {
     printf("[response] %s\n", message.dump().c_str());
     std::string framed = lsp::frame_message(message.dump());
@@ -116,7 +187,7 @@ net::awaitable<void> handle_local_session(
     auto socket_ptr = std::make_shared<tcp::socket>(std::move(socket));
     boost::system::error_code endpoint_error;
     const auto remote_endpoint = socket_ptr->remote_endpoint(endpoint_error);
-    session_manager->register_socket(socket_ptr);
+    auto session = session_manager->register_socket(socket_ptr);
 
     if (!endpoint_error) {
         printf("Accepted local client %s:%u\n", remote_endpoint.address().to_string().c_str(), remote_endpoint.port());
@@ -172,7 +243,7 @@ net::awaitable<void> handle_local_session(
             
             printf("JSON-RPC Request: %s\n", request.dump().c_str());
 
-            auto local_handling = bridge_local::handle_request(request);
+            auto local_handling = bridge_local::handle_request(session, request);
             if (!local_handling.forward_to_remote) {
                 if (local_handling.response.has_value()) {
                     co_await write_json_message(*socket_ptr, *local_handling.response);
@@ -187,7 +258,7 @@ net::awaitable<void> handle_local_session(
                             : "Closing local session after exit notification without prior shutdown\n"
                     );
                     close_socket_if_open(socket_ptr);
-                    session_manager->unregister_socket(socket_ptr);
+                    session_manager->unregister(session);
                     co_return;
                 }
 
@@ -241,14 +312,14 @@ net::awaitable<void> handle_local_session(
             printf("Closing local client %s:%u\n", remote_endpoint.address().to_string().c_str(), remote_endpoint.port());
         }
         close_socket_if_open(socket_ptr);
-        session_manager->unregister_socket(socket_ptr);
+        session_manager->unregister(session);
     }
 }
 // Remote reader coroutine: continuously receives from Go backend and broadcasts to all local sessions
 net::awaitable<void> remote_reader(
     std::shared_ptr<RemoteClient> remote,
-    std::shared_ptr<LocalSessionManager> session_manager,
-    std::shared_ptr<ResponseManager> response_manager) {
+    std::shared_ptr<ResponseManager> response_manager,
+    std::shared_ptr<RemoteNotificationQueue> notification_queue) {
     
     try {
         for (;;) {
@@ -273,7 +344,7 @@ net::awaitable<void> remote_reader(
                         response_manager->store_response(*maybe_id, response);
                     }
                 } else if (jsonrpc::is_valid_jsonrpc_notification(response)) {
-                    co_await session_manager->broadcast(message);
+                    notification_queue->push(std::move(message));
                 } else {
                     fprintf(stderr, "Invalid JSON-RPC message from Go backend ignored: %s\n", message.c_str());
                 }
@@ -282,6 +353,7 @@ net::awaitable<void> remote_reader(
             }
         }
     } catch (std::exception& e) {
+        notification_queue->close();
         fprintf(stderr, "Remote reader error: %s\n", e.what());
         throw;
     }
@@ -328,17 +400,27 @@ int main(int argc, char* argv[]) {
                     return std::make_shared<RemoteClient>(executor);
                 },
                 [session_manager, response_manager, settings](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
+                    auto executor = co_await net::this_coro::executor;
+                    auto notification_queue = std::make_shared<RemoteNotificationQueue>(executor);
+                    net::co_spawn(
+                        executor,
+                        remote_notification_forwarder(notification_queue, session_manager),
+                        net::detached
+                    );
+
                     try {
                         // WAIT for the connection to be fully established
                         co_await remote_client_ptr->connect(settings.remote_host, settings.remote_port);
 
                         // Start the loops that depend on that connection
-                        co_await remote_reader(remote_client_ptr, session_manager, response_manager);
+                        co_await remote_reader(remote_client_ptr, response_manager, notification_queue);
                     } catch (...) {
+                        notification_queue->close();
                         response_manager->cancel_all();
                         throw;
                     }
 
+                    notification_queue->close();
                     response_manager->cancel_all();
                 },
                 [](std::exception_ptr error) {

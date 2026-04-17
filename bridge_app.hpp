@@ -9,11 +9,16 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <set>
 
+#include "local_session.hpp"
 #include "bridge_protocol.hpp"
 
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
+inline void erase_sockets_by_identity(
+    std::vector<std::shared_ptr<LocalSession>>& sessions,
+    const std::vector<std::shared_ptr<tcp::socket>>& dead_sockets);
 
 struct BridgeSettings {
     unsigned short local_port = 6009;
@@ -57,25 +62,6 @@ inline void close_socket_if_open(const std::shared_ptr<tcp::socket>& socket) {
     socket->close(error);
 }
 
-inline void erase_sockets_by_identity(
-    std::vector<std::shared_ptr<tcp::socket>>& sockets,
-    const std::vector<std::shared_ptr<tcp::socket>>& dead_sockets) {
-
-    if (dead_sockets.empty()) {
-        return;
-    }
-
-    sockets.erase(
-        std::remove_if(sockets.begin(), sockets.end(),
-            [&dead_sockets](const std::shared_ptr<tcp::socket>& socket) {
-                return std::any_of(dead_sockets.begin(), dead_sockets.end(),
-                    [&socket](const std::shared_ptr<tcp::socket>& dead_socket) {
-                        return dead_socket.get() == socket.get();
-                    });
-            }),
-        sockets.end()
-    );
-}
 
 inline unsigned short parse_port_number(const std::string& value, const char* option_name) {
     try {
@@ -163,33 +149,35 @@ inline BridgeSettings parse_bridge_settings(int argc, char* argv[]) {
 
 class LocalSessionManager {
 private:
-    std::vector<std::shared_ptr<tcp::socket>> sockets_;
+    std::vector<std::shared_ptr<LocalSession>> sessions;
 
 public:
-    void register_socket(std::shared_ptr<tcp::socket> socket) {
-        sockets_.push_back(std::move(socket));
+    std::shared_ptr<LocalSession> register_socket(std::shared_ptr<tcp::socket> socket) {
+        sessions.push_back(std::make_shared<LocalSession>(std::move(socket)));
+        return sessions.back();
     }
 
-    void unregister_socket(const std::shared_ptr<tcp::socket>& socket) {
-        sockets_.erase(
-            std::remove_if(sockets_.begin(), sockets_.end(),
-                [&socket](const std::shared_ptr<tcp::socket>& current) {
-                    return current.get() == socket.get();
+    void unregister(std::shared_ptr<LocalSession> session) {
+        sessions.erase(
+            std::remove_if(sessions.begin(), sessions.end(),
+                [&session](const std::shared_ptr<LocalSession>& current) {
+                    return current == session;
                 }),
-            sockets_.end()
+            sessions.end()
         );
     }
 
-    std::size_t socket_count() const {
-        return sockets_.size();
+    std::size_t session_count() const {
+        return sessions.size();
     }
 
     net::awaitable<void> broadcast(std::string message) {
-        std::vector<std::shared_ptr<tcp::socket>> sockets_copy = sockets_;
+        std::vector<std::shared_ptr<LocalSession>> sessions_copy = sessions;
         std::vector<std::shared_ptr<tcp::socket>> dead_sockets;
         std::string framed_message = lsp::frame_message(message);
 
-        for (auto& socket : sockets_copy) {
+        for (auto& session : sessions_copy) {
+            auto socket = session->get_socket();
             if (socket_is_dead(socket)) {
                 dead_sockets.push_back(socket);
                 continue;
@@ -202,6 +190,7 @@ public:
             }
         }
 
-        erase_sockets_by_identity(sockets_, dead_sockets);
+        erase_sockets_by_identity(sessions, dead_sockets);
     }
 };
+

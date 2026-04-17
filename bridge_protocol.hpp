@@ -17,6 +17,7 @@
 #include <variant>
 
 #include <nlohmann/json.hpp>
+#include "local_session.hpp"
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
@@ -95,6 +96,10 @@ inline void append_chunk_to_buffer(beast::flat_buffer& buffer, const char* data,
 
 inline void log_local_notification(const std::string& method, const json& params = json::object()) {
     printf("Handled local notification %s: %s\n", method.c_str(), params.dump().c_str());
+}
+
+inline void log_local_request(const std::string& method, const json& params = json::object()) {
+    printf("Handled local request %s: %s\n", method.c_str(), params.dump().c_str());
 }
 
 template <typename AsyncReadStream>
@@ -335,35 +340,79 @@ enum class SessionDirective {
     close_session,
 };
 
-struct RequestHandlingResult {
+struct RequestResult {
     bool forward_to_remote = false;
     std::optional<json> response;
     SessionDirective directive = SessionDirective::none;
+
+    static auto error_response(const json& id, int code, const std::string& message) {
+        return RequestResult{
+            false,
+            jsonrpc::create_error(id, code, message),
+            SessionDirective::none
+        };
+    }
+
+    static auto forward() {
+        return RequestResult{
+            true,
+            std::nullopt,
+            SessionDirective::none
+        };
+    }
+
+    static auto local_response(const json& response, SessionDirective directive = SessionDirective::none) {
+        return RequestResult{
+            false,
+            response,
+            directive
+        };
+    }
 };
 
-inline RequestHandlingResult handle_request(const json& request) {
+struct SubscribeParam {
+    std::string project_id;
+    static std::optional<SubscribeParam> from_json(const json& params) {
+        if (!params.is_object() || !params.contains("project_id") || !params["project_id"].is_string()) {
+            return std::nullopt;
+        }
+
+        return SubscribeParam{params["project_id"].get<std::string>()};
+    }
+};
+
+inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const json& request) {
     if (!request.is_object() || !request.contains("method") || !request["method"].is_string()) {
-        return {};
+        return RequestResult::error_response(request.value("id", nullptr), -32600, "Invalid Request: missing or invalid 'method' field");
     }
 
     const std::string method = request["method"].get<std::string>();
     if (method.rfind("simpletm/", 0) == 0) {
-        return RequestHandlingResult{true, std::nullopt};
+        if (method == "simpletm/subscribeProject") {
+            const auto params = SubscribeParam::from_json(request.value("params", json::object()));
+            if (!params.has_value()) {
+                return RequestResult::error_response(request.value("id", nullptr), -32602, "Invalid params");
+            }
+
+            session->register_subscription(params->project_id);
+            lsp::log_local_request(method, request.value("params", json::object()));
+        }
+        return RequestResult::forward();
     }
 
     if (method == "initialized") {
-        lsp::log_local_notification(method, request.value("params", json::object()));
+        lsp::log_local_request(method, request.value("params", json::object()));
         return {};
     }
 
     if (method == "$/setTrace") {
-        lsp::log_local_notification(method, request.value("params", json::object()));
+        lsp::log_local_request(method, request.value("params", json::object()));
         return {};
     }
 
     if (method == "exit") {
-        lsp::log_local_notification(method, request.value("params", json::object()));
-        return RequestHandlingResult{false, std::nullopt, SessionDirective::close_session};
+        lsp::log_local_request(method, request.value("params", json::object()));
+        return RequestResult{false, std::nullopt, SessionDirective::close_session};
     }
 
     if (method == "dltxt/echo") {
@@ -375,11 +424,9 @@ inline RequestHandlingResult handle_request(const json& request) {
         const std::string message = params.value("message", "");
         printf("Echoing message from client: %s\n", message.c_str());
 
-        return RequestHandlingResult{
-            false,
-            jsonrpc::create_response(request["id"], json{{"result", message}}),
-            SessionDirective::none
-        };
+        return RequestResult::local_response(
+            jsonrpc::create_response(request["id"], json{{"result", message}})
+        );
     }
 
     if (!request.contains("id")) {
@@ -388,27 +435,20 @@ inline RequestHandlingResult handle_request(const json& request) {
 
     if (method == "initialize") {
         printf("Handled initialize request %s locally\n", request["id"].dump().c_str());
-        return RequestHandlingResult{
-            false,
-            jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}}),
-            SessionDirective::none
-        };
+        return RequestResult::local_response(
+            jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}})
+        );
     }
 
     if (method == "shutdown") {
         printf("Handled shutdown request %s locally\n", request["id"].dump().c_str());
-        return RequestHandlingResult{
-            false,
+        return RequestResult::local_response(
             jsonrpc::create_response(request["id"], nullptr),
             SessionDirective::mark_shutdown_requested
-        };
+        );
     }
 
-    return RequestHandlingResult{
-        false,
-        jsonrpc::create_error(request["id"], -32601, "method " + method + " is not recognized"),
-        SessionDirective::none
-    };
+    return RequestResult::error_response(request["id"], -32601, "method " + method + " is not recognized");
 }
 }
 
