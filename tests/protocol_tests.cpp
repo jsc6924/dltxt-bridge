@@ -189,6 +189,91 @@ DEFINE_TEST(test_local_session_manager_register_socket_preserves_shared_socket_i
     assert(session->get_socket() == socket);
 }
 
+DEFINE_TEST(test_remote_notification_forwarder_broadcasts_to_local_clients) {
+    net::io_context ioc;
+    auto session_manager = std::make_shared<LocalSessionManager>();
+    auto notification_queue = std::make_shared<RemoteNotificationQueue>(ioc.get_executor());
+
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    tcp::socket client_socket(ioc);
+    client_socket.connect({net::ip::address_v4::loopback(), acceptor.local_endpoint().port()});
+
+    auto server_socket = std::make_shared<tcp::socket>(ioc);
+    acceptor.accept(*server_socket);
+    session_manager->register_socket(server_socket);
+
+    const std::string payload = R"({"jsonrpc":"2.0","method":"simpletm/progress","params":{"project_id":"demo"}})";
+    std::optional<std::optional<std::string>> received_message;
+    beast::flat_buffer read_buffer;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            received_message = co_await lsp::read_message(client_socket, read_buffer);
+            co_return;
+        },
+        net::detached);
+
+    notification_queue->push(payload);
+    notification_queue->close();
+
+    net::co_spawn(ioc,
+        remote_notification_forwarder(notification_queue, session_manager),
+        net::detached);
+
+    ioc.run();
+
+    assert(received_message.has_value());
+    assert(received_message->has_value());
+    assert(**received_message == payload);
+}
+
+DEFINE_TEST(test_local_session_write_framed_serializes_overlapping_writes) {
+    net::io_context ioc;
+
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    tcp::socket client_socket(ioc);
+    client_socket.connect({net::ip::address_v4::loopback(), acceptor.local_endpoint().port()});
+
+    auto server_socket = std::make_shared<tcp::socket>(ioc);
+    acceptor.accept(*server_socket);
+    auto session = std::make_shared<LocalSession>(server_socket);
+
+    const std::string first_payload = R"({"jsonrpc":"2.0","method":"first"})";
+    const std::string second_payload = R"({"jsonrpc":"2.0","method":"second"})";
+    std::optional<std::optional<std::string>> first_received;
+    std::optional<std::optional<std::string>> second_received;
+    beast::flat_buffer read_buffer;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            first_received = co_await lsp::read_message(client_socket, read_buffer);
+            second_received = co_await lsp::read_message(client_socket, read_buffer);
+            co_return;
+        },
+        net::detached);
+
+    net::co_spawn(ioc,
+        [session, first_payload]() -> net::awaitable<void> {
+            co_await session->write_framed(lsp::frame_message(first_payload));
+        },
+        net::detached);
+
+    net::co_spawn(ioc,
+        [session, second_payload]() -> net::awaitable<void> {
+            co_await session->write_framed(lsp::frame_message(second_payload));
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(first_received.has_value());
+    assert(first_received->has_value());
+    assert(**first_received == first_payload);
+    assert(second_received.has_value());
+    assert(second_received->has_value());
+    assert(**second_received == second_payload);
+}
+
 DEFINE_TEST(test_close_socket_if_open_closes_socket) {
     net::io_context ioc;
     auto socket = std::make_shared<tcp::socket>(ioc);

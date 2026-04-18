@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <deque>
+#include <optional>
 
 #include "local_session.hpp"
 #include "bridge_protocol.hpp"
@@ -184,7 +186,7 @@ public:
             }
 
             try {
-                co_await net::async_write(*socket, net::buffer(framed_message), net::use_awaitable);
+                co_await session->write_framed(framed_message);
             } catch (...) {
                 dead_sockets.push_back(socket);
             }
@@ -193,4 +195,74 @@ public:
         erase_sockets_by_identity(sessions, dead_sockets);
     }
 };
+
+class RemoteNotificationQueue {
+    net::steady_timer signal_;
+    std::deque<std::string> messages_;
+    bool closed_ = false;
+
+public:
+    explicit RemoteNotificationQueue(net::any_io_executor executor)
+        : signal_(executor) {
+        signal_.expires_at((std::chrono::steady_clock::time_point::max)());
+    }
+
+    void push(std::string message) {
+        if (closed_) {
+            return;
+        }
+
+        messages_.push_back(std::move(message));
+        signal_.cancel_one();
+    }
+
+    void close() {
+        if (closed_) {
+            return;
+        }
+
+        closed_ = true;
+        signal_.cancel();
+    }
+
+    net::awaitable<std::optional<std::string>> wait_and_pop() {
+        for (;;) {
+            if (!messages_.empty()) {
+                std::string message = std::move(messages_.front());
+                messages_.pop_front();
+                co_return message;
+            }
+
+            if (closed_) {
+                co_return std::nullopt;
+            }
+
+            signal_.expires_at((std::chrono::steady_clock::time_point::max)());
+            auto [error] = co_await signal_.async_wait(net::as_tuple(net::use_awaitable));
+            if (error && error != net::error::operation_aborted) {
+                throw boost::system::system_error(error);
+            }
+        }
+    }
+};
+
+inline net::awaitable<void> remote_notification_forwarder(
+    std::shared_ptr<RemoteNotificationQueue> notification_queue,
+    std::shared_ptr<LocalSessionManager> session_manager) {
+
+    try {
+        for (;;) {
+            auto message = co_await notification_queue->wait_and_pop();
+            if (!message.has_value()) {
+                co_return;
+            }
+
+            printf("Forwarding remote notification to local clients: %s\n", message->c_str());
+            co_await session_manager->broadcast(*message);
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Remote notification forwarder error: %s\n", e.what());
+        throw;
+    }
+}
 

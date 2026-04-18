@@ -12,58 +12,8 @@
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 using RemoteRegistry = ActiveRemote<class RemoteClient>;
-net::awaitable<void> write_json_message(tcp::socket& socket, const json& message);
-net::awaitable<void> write_json_error(tcp::socket& socket, const json& id, int code, const std::string& message);
-
-class RemoteNotificationQueue {
-    net::steady_timer signal_;
-    std::deque<std::string> messages_;
-    bool closed_ = false;
-
-public:
-    explicit RemoteNotificationQueue(net::any_io_executor executor)
-        : signal_(executor) {
-        signal_.expires_at((std::chrono::steady_clock::time_point::max)());
-    }
-
-    void push(std::string message) {
-        if (closed_) {
-            return;
-        }
-
-        messages_.push_back(std::move(message));
-        signal_.cancel_one();
-    }
-
-    void close() {
-        if (closed_) {
-            return;
-        }
-
-        closed_ = true;
-        signal_.cancel();
-    }
-
-    net::awaitable<std::optional<std::string>> wait_and_pop() {
-        for (;;) {
-            if (!messages_.empty()) {
-                std::string message = std::move(messages_.front());
-                messages_.pop_front();
-                co_return message;
-            }
-
-            if (closed_) {
-                co_return std::nullopt;
-            }
-
-            signal_.expires_at((std::chrono::steady_clock::time_point::max)());
-            auto [error] = co_await signal_.async_wait(net::as_tuple(net::use_awaitable));
-            if (error && error != net::error::operation_aborted) {
-                throw boost::system::system_error(error);
-            }
-        }
-    }
-};
+net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message);
+net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& session, const json& id, int code, const std::string& message);
 
 class RemoteClient {
     net::strand<net::any_io_executor> strand_;
@@ -129,52 +79,33 @@ public:
     }
 };
 
-net::awaitable<void> heartbeat_loop(tcp::socket& socket) {
+net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session) {
     try {
-        while (socket.is_open()) {
-            net::steady_timer timer(socket.get_executor());
+        auto socket = session->get_socket();
+        while (session->is_open()) {
+            net::steady_timer timer(socket->get_executor());
             timer.expires_after(std::chrono::seconds(10));
             co_await timer.async_wait(net::use_awaitable);
 
-            if (!socket.is_open()) {
+            if (!session->is_open()) {
                 break;
             }
 
-            co_await write_json_message(socket, jsonrpc::create_notification("dltxt/notification", {{"message", "heartbeat"}}));
+            co_await write_json_message(session, jsonrpc::create_notification("dltxt/notification", {{"message", "heartbeat"}}));
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "Heartbeat loop error: %s\n", e.what());
     }
 }
 
-net::awaitable<void> remote_notification_forwarder(
-    std::shared_ptr<RemoteNotificationQueue> notification_queue,
-    std::shared_ptr<LocalSessionManager> session_manager) {
-
-    try {
-        for (;;) {
-            auto message = co_await notification_queue->wait_and_pop();
-            if (!message.has_value()) {
-                co_return;
-            }
-
-            printf("Forwarding remote notification to local clients: %s\n", message->c_str());
-            co_await session_manager->broadcast(*message);
-        }
-    } catch (const std::exception& e) {
-        fprintf(stderr, "Remote notification forwarder error: %s\n", e.what());
-        throw;
-    }
-}
-
-net::awaitable<void> write_json_message(tcp::socket& socket, const json& message) {
+net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message) {
     printf("[response] %s\n", message.dump().c_str());
     std::string framed = lsp::frame_message(message.dump());
-    co_await net::async_write(socket, net::buffer(framed), net::use_awaitable);
+    co_await session->write_framed(std::move(framed));
 }
 
-net::awaitable<void> write_json_error(tcp::socket& socket, const json& id, int code, const std::string& message) {
-    co_await write_json_message(socket, jsonrpc::create_error(id, code, message));
+net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& session, const json& id, int code, const std::string& message) {
+    co_await write_json_message(session, jsonrpc::create_error(id, code, message));
 }
 
 net::awaitable<void> handle_local_session(
@@ -198,7 +129,7 @@ net::awaitable<void> handle_local_session(
     beast::flat_buffer buffer;
     bool shutdown_requested = false;
 
-    net::co_spawn(socket_ptr->get_executor(), heartbeat_loop(*socket_ptr), net::detached);
+    net::co_spawn(socket_ptr->get_executor(), heartbeat_loop(session), net::detached);
     
     try {
         for (;;) {
@@ -229,14 +160,14 @@ net::awaitable<void> handle_local_session(
             // Validate JSON-RPC request
             if (!request.contains("jsonrpc") || request["jsonrpc"] != "2.0") {
                 if (request.contains("id")) {
-                    co_await write_json_error(*socket_ptr, request["id"], -32600, "Invalid Request");
+                    co_await write_json_error(session, request["id"], -32600, "Invalid Request");
                 }
                 continue;
             }
             
             if (!request.contains("method")) {
                 if (request.contains("id")) {
-                    co_await write_json_error(*socket_ptr, request["id"], -32600, "Missing method");
+                    co_await write_json_error(session, request["id"], -32600, "Missing method");
                 }
                 continue;
             }
@@ -246,7 +177,7 @@ net::awaitable<void> handle_local_session(
             auto local_handling = bridge_local::handle_request(session, request);
             if (!local_handling.forward_to_remote) {
                 if (local_handling.response.has_value()) {
-                    co_await write_json_message(*socket_ptr, *local_handling.response);
+                    co_await write_json_message(session, *local_handling.response);
                 }
 
                 if (local_handling.directive == bridge_local::SessionDirective::mark_shutdown_requested) {
@@ -268,7 +199,7 @@ net::awaitable<void> handle_local_session(
             auto remote = remote_registry->get();
             if (!remote) {
                 if (request.contains("id")) {
-                    co_await write_json_error(*socket_ptr, request["id"], -32000, "Remote server unavailable");
+                    co_await write_json_error(session, request["id"], -32000, "Remote server unavailable");
                 }
                 continue;
             }
@@ -276,7 +207,7 @@ net::awaitable<void> handle_local_session(
             if (request.contains("id")) {
                 auto maybe_id = jsonrpc::request_id_from_json(request["id"]);
                 if (!maybe_id.has_value() || !jsonrpc::is_trackable_request_id(*maybe_id)) {
-                    co_await write_json_error(*socket_ptr, request["id"], -32600, "Invalid Request id");
+                    co_await write_json_error(session, request["id"], -32600, "Invalid Request id");
                     continue;
                 }
 
@@ -295,11 +226,11 @@ net::awaitable<void> handle_local_session(
                 auto wait_result = co_await response_manager->wait_for_response(bridge_id);
 
                 if (wait_result.status == ResponseManager::WaitStatus::response_ready && wait_result.response.has_value()) {
-                    co_await write_json_message(*socket_ptr, *wait_result.response);
+                    co_await write_json_message(session, *wait_result.response);
                 } else if (wait_result.status == ResponseManager::WaitStatus::timed_out) {
-                    co_await write_json_error(*socket_ptr, original_id_json, -32001, "Request timed out");
+                    co_await write_json_error(session, original_id_json, -32001, "Request timed out");
                 } else if (wait_result.status == ResponseManager::WaitStatus::cancelled) {
-                    co_await write_json_error(*socket_ptr, original_id_json, -32002, "Remote server disconnected while awaiting response");
+                    co_await write_json_error(session, original_id_json, -32002, "Remote server disconnected while awaiting response");
                 }
             } else {
                 // It's a notification, just fire and forget
