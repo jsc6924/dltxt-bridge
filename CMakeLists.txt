@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
-project(DltxtBridge LANGUAGES CXX)
+
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg.json DLTXT_BRIDGE_VCPKG_MANIFEST)
+string(JSON DLTXT_BRIDGE_PROJECT_VERSION GET ${DLTXT_BRIDGE_VCPKG_MANIFEST} version)
+
+project(DltxtBridge VERSION ${DLTXT_BRIDGE_PROJECT_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,11 +22,15 @@ find_package(OpenSSL REQUIRED)
 
 enable_testing()
 
+configure_file(bridge_version.hpp.in bridge_version.hpp @ONLY)
+
 add_executable(dltxt_bridge main.cpp)
+target_include_directories(dltxt_bridge PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_executable(dltxt_bridge_tests tests/protocol_tests.cpp)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg.json
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_tests.cpp
 )
 

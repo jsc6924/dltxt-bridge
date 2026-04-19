@@ -109,6 +109,7 @@ DEFINE_TEST(test_parse_bridge_settings_defaults) {
     assert(settings.remote_host == "127.0.0.1");
     assert(settings.remote_port == "9000");
     assert(settings.request_timeout == std::chrono::seconds(30));
+    assert(!settings.show_version);
 }
 
 DEFINE_TEST(test_parse_bridge_settings_overrides) {
@@ -123,6 +124,16 @@ DEFINE_TEST(test_parse_bridge_settings_overrides) {
     assert(settings.remote_host == "example.com");
     assert(settings.remote_port == "9010");
     assert(settings.request_timeout == std::chrono::milliseconds(1500));
+    assert(!settings.show_version);
+}
+
+DEFINE_TEST(test_parse_bridge_settings_version_flag) {
+    const BridgeSettings settings = parse_bridge_settings({"--version"});
+
+    assert(settings.show_version);
+    assert(settings.local_port == 6009);
+    assert(settings.remote_host == "127.0.0.1");
+    assert(settings.remote_port == "9000");
 }
 
 DEFINE_TEST(test_parse_bridge_settings_rejects_invalid_port) {

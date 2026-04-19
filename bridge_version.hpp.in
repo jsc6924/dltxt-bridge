@@ -1,0 +1,5 @@
+#pragma once
+
+namespace dltxt_bridge {
+inline constexpr char version[] = "@PROJECT_VERSION@";
+}

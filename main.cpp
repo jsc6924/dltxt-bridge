@@ -6,6 +6,7 @@
 #include "bridge_app.hpp"
 #include "bridge_protocol.hpp"
 #include "bridge_runtime.hpp"
+#include "bridge_version.hpp"
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -361,6 +362,11 @@ int main(int argc, char* argv[]) {
     try {
         configure_stdio_for_immediate_flush();
         const BridgeSettings settings = parse_bridge_settings(argc, argv);
+        if (settings.show_version) {
+            printf("dltxt_bridge %s\n", dltxt_bridge::version);
+            return 0;
+        }
+
         net::io_context ioc;
         auto stop_signals = install_stop_signals(ioc);
 
@@ -427,7 +433,7 @@ int main(int argc, char* argv[]) {
         ioc.run();
     } catch (const std::invalid_argument& e) {
         fprintf(stderr, "Configuration Error: %s\n", e.what());
-        fprintf(stderr, "Usage: dltxt_bridge [--listen-port <port>] [--remote-host <host>] [--remote-port <port>] [--request-timeout-ms <ms>]\n");
+        fprintf(stderr, "Usage: dltxt_bridge [--listen-port <port>] [--remote-host <host>] [--remote-port <port>] [--request-timeout-ms <ms>] [--version]\n");
         return 1;
     } catch (std::exception& e) {
         fprintf(stderr, "Bridge Error: %s\n", e.what());

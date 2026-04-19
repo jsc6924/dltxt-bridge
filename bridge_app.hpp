@@ -28,6 +28,7 @@ struct BridgeSettings {
     std::string remote_host = "127.0.0.1";
     std::string remote_port = "9000";
     std::chrono::milliseconds request_timeout = std::chrono::seconds(30);
+    bool show_version = false;
 };
 
 inline std::vector<int> bridge_signal_numbers() {
@@ -130,6 +131,11 @@ inline BridgeSettings parse_bridge_settings(const std::vector<std::string>& args
             }
 
             settings.request_timeout = parse_timeout_ms(args[++index], "--request-timeout-ms");
+            continue;
+        }
+
+        if (arg == "--version") {
+            settings.show_version = true;
             continue;
         }
 
