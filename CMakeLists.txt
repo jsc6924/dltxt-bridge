@@ -13,6 +13,7 @@ endif()
 # Find dependencies via vcpkg
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 enable_testing()
 
@@ -28,6 +29,8 @@ target_link_libraries(dltxt_bridge PRIVATE
     Boost::headers
     Boost::system
     nlohmann_json::nlohmann_json
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 target_link_libraries(dltxt_bridge_tests PRIVATE 

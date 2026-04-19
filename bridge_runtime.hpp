@@ -27,6 +27,10 @@ public:
             current_.reset();
         }
     }
+
+    bool is_active() const {
+        return !!current_;
+    }
 };
 
 template <typename Remote, typename MakeRemote, typename RunRemote, typename OnError>

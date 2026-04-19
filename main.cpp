@@ -1,6 +1,8 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/ssl.hpp>
 #include "bridge_app.hpp"
 #include "bridge_protocol.hpp"
 #include "bridge_runtime.hpp"
@@ -11,6 +13,7 @@
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
+namespace ssl = net::ssl;
 using RemoteRegistry = ActiveRemote<class RemoteClient>;
 net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message);
 net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& session, const json& id, int code, const std::string& message);
@@ -22,14 +25,25 @@ void configure_stdio_for_immediate_flush() {
 
 class RemoteClient {
     net::strand<net::any_io_executor> strand_;
-    websocket::stream<beast::tcp_stream> ws_;
+    std::optional<ssl::context> ssl_ctx_;
+    using PlainWs = websocket::stream<beast::tcp_stream>;
+    using SslWs   = websocket::stream<beast::ssl_stream<beast::tcp_stream>>;
+    std::variant<PlainWs, SslWs> ws_;
     std::deque<std::string> write_queue_;
     bool write_in_progress_ = false;
 
 public:
-    explicit RemoteClient(net::any_io_executor ex)
+    explicit RemoteClient(net::any_io_executor ex, bool use_ssl)
         : strand_(net::make_strand(ex)),
-          ws_(strand_) {}
+          ssl_ctx_(use_ssl ? std::optional<ssl::context>(ssl::context::tls_client) : std::nullopt),
+          ws_(use_ssl
+              ? std::variant<PlainWs, SslWs>(std::in_place_type<SslWs>, strand_, *ssl_ctx_)
+              : std::variant<PlainWs, SslWs>(std::in_place_type<PlainWs>, strand_)) {
+        if (ssl_ctx_) {
+            ssl_ctx_->set_default_verify_paths();
+            ssl_ctx_->set_verify_mode(ssl::verify_peer);
+        }
+    }
 
     net::awaitable<void> connect(std::string host, std::string port) {
         co_await net::dispatch(strand_, net::use_awaitable);
@@ -37,14 +51,28 @@ public:
         tcp::resolver resolver(strand_);
         auto const results = co_await resolver.async_resolve(host, port, net::use_awaitable);
 
-        // Connect and Handshake
-        beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(30));
-        co_await beast::get_lowest_layer(ws_).async_connect(results, net::use_awaitable);
-        
-        // Turn off timeout on the tcp_stream because websocket has its own
-        beast::get_lowest_layer(ws_).expires_never();
+        if (auto* plain = std::get_if<PlainWs>(&ws_)) {
+            beast::get_lowest_layer(*plain).expires_after(std::chrono::seconds(30));
+            co_await beast::get_lowest_layer(*plain).async_connect(results, net::use_awaitable);
+            beast::get_lowest_layer(*plain).expires_never();
+            co_await plain->async_handshake(host, "/ws", net::use_awaitable);
+        } else {
+            auto& ssl_ws = std::get<SslWs>(ws_);
+            beast::get_lowest_layer(ssl_ws).expires_after(std::chrono::seconds(30));
+            co_await beast::get_lowest_layer(ssl_ws).async_connect(results, net::use_awaitable);
 
-        co_await ws_.async_handshake(host, "/ws", net::use_awaitable);
+            // Set SNI hostname — required for virtual hosting / Let's Encrypt
+            if (!SSL_set_tlsext_host_name(ssl_ws.next_layer().native_handle(), host.c_str())) {
+                beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
+                throw beast::system_error{ec};
+            }
+
+            beast::get_lowest_layer(ssl_ws).expires_after(std::chrono::seconds(30));
+            co_await ssl_ws.next_layer().async_handshake(ssl::stream_base::client, net::use_awaitable);
+            beast::get_lowest_layer(ssl_ws).expires_never();
+            co_await ssl_ws.async_handshake(host, "/ws", net::use_awaitable);
+        }
+
         printf("Connected to Go Backend at %s:%s\n", host.c_str(), port.c_str());
     }
 
@@ -64,7 +92,11 @@ public:
                 write_queue_.pop_front();
 
                 printf("Sending to Go backend: %s\n", next.c_str());
-                co_await ws_.async_write(net::buffer(next), net::use_awaitable);
+                if (auto* plain = std::get_if<PlainWs>(&ws_)) {
+                    co_await plain->async_write(net::buffer(next), net::use_awaitable);
+                } else {
+                    co_await std::get<SslWs>(ws_).async_write(net::buffer(next), net::use_awaitable);
+                }
                 printf("Message sent to Go backend\n");
             }
         } catch (...) {
@@ -79,12 +111,16 @@ public:
         co_await net::dispatch(strand_, net::use_awaitable);
 
         beast::flat_buffer buffer;
-        co_await ws_.async_read(buffer, net::use_awaitable);
+        if (auto* plain = std::get_if<PlainWs>(&ws_)) {
+            co_await plain->async_read(buffer, net::use_awaitable);
+        } else {
+            co_await std::get<SslWs>(ws_).async_read(buffer, net::use_awaitable);
+        }
         co_return beast::buffers_to_string(buffer.data());
     }
 };
 
-net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session) {
+net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session, std::shared_ptr<RemoteRegistry> remote_registry) {
     try {
         auto socket = session->get_socket();
         while (session->is_open()) {
@@ -96,7 +132,13 @@ net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session) {
                 break;
             }
 
-            co_await write_json_message(session, jsonrpc::create_notification("dltxt/notification", {{"message", "heartbeat"}}));
+            co_await write_json_message(
+                session,
+                jsonrpc::create_notification(
+                    "dltxt/notification",
+                    json{{"message", "heartbeat"}, {"remote_available", remote_registry->is_active()}}
+                )
+            );
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "Heartbeat loop error: %s\n", e.what());
@@ -134,7 +176,7 @@ net::awaitable<void> handle_local_session(
     beast::flat_buffer buffer;
     bool shutdown_requested = false;
 
-    net::co_spawn(socket_ptr->get_executor(), heartbeat_loop(session), net::detached);
+    net::co_spawn(socket_ptr->get_executor(), heartbeat_loop(session, remote_registry), net::detached);
     
     try {
         for (;;) {
@@ -325,9 +367,9 @@ int main(int argc, char* argv[]) {
         auto remote_registry = std::make_shared<RemoteRegistry>();
         auto session_manager = std::make_shared<LocalSessionManager>(
             ioc.get_executor(),
-            std::chrono::minutes(1),
+            std::chrono::minutes(15),
             [&ioc]() {
-                printf("No local sessions connected for 60 seconds; shutting down bridge\n");
+                printf("No local sessions connected for 15 minutes; shutting down bridge\n");
                 ioc.stop();
             });
         auto response_manager = std::make_shared<ResponseManager>();
@@ -339,8 +381,8 @@ int main(int argc, char* argv[]) {
 
             co_await run_remote_retry_loop(
                 remote_registry,
-                [](net::any_io_executor executor) {
-                    return std::make_shared<RemoteClient>(executor);
+                [settings](net::any_io_executor executor) {
+                    return std::make_shared<RemoteClient>(executor, settings.remote_port == "443");
                 },
                 [session_manager, response_manager, settings](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
                     auto executor = co_await net::this_coro::executor;
