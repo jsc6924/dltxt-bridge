@@ -189,6 +189,57 @@ DEFINE_TEST(test_local_session_manager_register_socket_preserves_shared_socket_i
     assert(session->get_socket() == socket);
 }
 
+DEFINE_TEST(test_local_session_manager_stops_when_idle_timeout_expires) {
+    net::io_context ioc;
+    bool idle_timeout_triggered = false;
+
+    LocalSessionManager manager(
+        ioc.get_executor(),
+        std::chrono::milliseconds(5),
+        [&]() {
+            idle_timeout_triggered = true;
+            ioc.stop();
+        });
+
+    ioc.run();
+
+    assert(idle_timeout_triggered);
+}
+
+DEFINE_TEST(test_local_session_manager_rearms_idle_timeout_after_last_disconnect) {
+    net::io_context ioc;
+    bool idle_timeout_triggered = false;
+
+    LocalSessionManager manager(
+        ioc.get_executor(),
+        std::chrono::milliseconds(10),
+        [&]() {
+            idle_timeout_triggered = true;
+            ioc.stop();
+        });
+
+    auto socket = std::make_shared<tcp::socket>(ioc);
+    socket->open(tcp::v4());
+    const auto session = manager.register_socket(socket);
+
+    net::steady_timer probe_timer(ioc);
+    probe_timer.expires_after(std::chrono::milliseconds(2));
+    probe_timer.async_wait([&](const boost::system::error_code&) {
+        ioc.stop();
+    });
+
+    ioc.run();
+
+    assert(!idle_timeout_triggered);
+
+    manager.unregister(session);
+
+    ioc.restart();
+    ioc.run();
+
+    assert(idle_timeout_triggered);
+}
+
 DEFINE_TEST(test_remote_notification_forwarder_broadcasts_to_local_clients) {
     net::io_context ioc;
     auto session_manager = std::make_shared<LocalSessionManager>();

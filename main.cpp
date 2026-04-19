@@ -323,7 +323,13 @@ int main(int argc, char* argv[]) {
         auto stop_signals = install_stop_signals(ioc);
 
         auto remote_registry = std::make_shared<RemoteRegistry>();
-        auto session_manager = std::make_shared<LocalSessionManager>();
+        auto session_manager = std::make_shared<LocalSessionManager>(
+            ioc.get_executor(),
+            std::chrono::minutes(1),
+            [&ioc]() {
+                printf("No local sessions connected for 60 seconds; shutting down bridge\n");
+                ioc.stop();
+            });
         auto response_manager = std::make_shared<ResponseManager>();
 
         // Launch ONE coordinator coroutine to handle startup order

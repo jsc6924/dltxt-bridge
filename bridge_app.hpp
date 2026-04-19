@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <csignal>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -151,11 +152,83 @@ inline BridgeSettings parse_bridge_settings(int argc, char* argv[]) {
 
 class LocalSessionManager {
 private:
+    class IdleShutdownMonitor {
+    private:
+        net::steady_timer timer_;
+        std::chrono::milliseconds timeout_;
+        std::function<void()> on_timeout_;
+        std::size_t generation_ = 0;
+
+        void arm_timer() {
+            if (timeout_.count() <= 0 || !on_timeout_) {
+                return;
+            }
+
+            const std::size_t generation = ++generation_;
+            timer_.expires_after(timeout_);
+            timer_.async_wait([this, generation](const boost::system::error_code& error) {
+                if (error == net::error::operation_aborted) {
+                    return;
+                }
+
+                if (error || generation != generation_) {
+                    return;
+                }
+
+                on_timeout_();
+            });
+        }
+
+        void cancel_timer() {
+            ++generation_;
+            timer_.cancel();
+        }
+
+    public:
+        IdleShutdownMonitor(
+            net::any_io_executor executor,
+            std::chrono::milliseconds timeout,
+            std::function<void()> on_timeout)
+            : timer_(executor),
+              timeout_(timeout),
+              on_timeout_(std::move(on_timeout)) {
+            arm_timer();
+        }
+
+        void update(std::size_t session_count) {
+            if (session_count == 0) {
+                arm_timer();
+                return;
+            }
+
+            cancel_timer();
+        }
+    };
+
     std::vector<std::shared_ptr<LocalSession>> sessions;
+    std::unique_ptr<IdleShutdownMonitor> idle_shutdown_monitor_;
+
+    void on_session_count_changed() {
+        if (idle_shutdown_monitor_) {
+            idle_shutdown_monitor_->update(sessions.size());
+        }
+    }
 
 public:
+    LocalSessionManager() = default;
+
+    LocalSessionManager(
+        net::any_io_executor executor,
+        std::chrono::milliseconds idle_timeout,
+        std::function<void()> on_idle_timeout)
+        : idle_shutdown_monitor_(std::make_unique<IdleShutdownMonitor>(
+            executor,
+            idle_timeout,
+            std::move(on_idle_timeout))) {}
+
     std::shared_ptr<LocalSession> register_socket(std::shared_ptr<tcp::socket> socket) {
         sessions.push_back(std::make_shared<LocalSession>(std::move(socket)));
+        on_session_count_changed();
         return sessions.back();
     }
 
@@ -167,6 +240,7 @@ public:
                 }),
             sessions.end()
         );
+        on_session_count_changed();
     }
 
     std::size_t session_count() const {
@@ -193,6 +267,7 @@ public:
         }
 
         erase_sockets_by_identity(sessions, dead_sockets);
+        on_session_count_changed();
     }
 };
 
