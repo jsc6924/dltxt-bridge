@@ -15,6 +15,11 @@ using RemoteRegistry = ActiveRemote<class RemoteClient>;
 net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message);
 net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& session, const json& id, int code, const std::string& message);
 
+void configure_stdio_for_immediate_flush() {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+}
+
 class RemoteClient {
     net::strand<net::any_io_executor> strand_;
     websocket::stream<beast::tcp_stream> ws_;
@@ -312,6 +317,7 @@ net::awaitable<void> listener(
 
 int main(int argc, char* argv[]) {
     try {
+        configure_stdio_for_immediate_flush();
         const BridgeSettings settings = parse_bridge_settings(argc, argv);
         net::io_context ioc;
         auto stop_signals = install_stop_signals(ioc);
