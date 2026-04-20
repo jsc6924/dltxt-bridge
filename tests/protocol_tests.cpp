@@ -6,11 +6,13 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "../local_session.hpp"
 #include "../bridge_app.hpp"
+#include "../bridge_http_proxy.hpp"
 #include "../bridge_protocol.hpp"
 #include "../bridge_runtime.hpp"
 
@@ -105,7 +107,7 @@ DEFINE_TEST(test_parse_content_length_too_large) {
 DEFINE_TEST(test_parse_bridge_settings_defaults) {
     const BridgeSettings settings = parse_bridge_settings({});
 
-    assert(settings.local_port == 6009);
+    assert(settings.local_port == 6010);
     assert(settings.remote_host == "127.0.0.1");
     assert(settings.remote_port == "9000");
     assert(settings.request_timeout == std::chrono::seconds(30));
@@ -131,9 +133,208 @@ DEFINE_TEST(test_parse_bridge_settings_version_flag) {
     const BridgeSettings settings = parse_bridge_settings({"--version"});
 
     assert(settings.show_version);
-    assert(settings.local_port == 6009);
+    assert(settings.local_port == 6010);
     assert(settings.remote_host == "127.0.0.1");
     assert(settings.remote_port == "9000");
+}
+
+DEFINE_TEST(test_local_http_proxy_uses_fixed_port_distinct_from_lsp_listener) {
+    const BridgeSettings settings = parse_bridge_settings({});
+
+    assert(bridge_http::local_http_port == 9286);
+    assert(bridge_http::local_http_port != settings.local_port);
+}
+
+DEFINE_TEST(test_extract_application_id_from_script_asset) {
+    const auto application_id = bridge_http::extract_application_id(R"(window._ApplicationId = "AbC123")");
+
+    assert(application_id.has_value());
+    assert(*application_id == "AbC123");
+}
+
+DEFINE_TEST(test_extract_preload_script_urls_resolves_relative_and_absolute_hrefs) {
+    const std::string html = R"(
+        <html>
+            <head>
+                <link rel="preload" as="script" href="/assets/app.js">
+                <link as="script" rel="preload" href="https://cdn.example.com/vendor.js">
+                <link rel="stylesheet" href="/assets/app.css">
+            </head>
+        </html>)";
+
+    const auto urls = bridge_http::extract_preload_script_urls(html, "https://www.mojidict.com/");
+
+    assert(urls.size() == 2);
+    assert(urls[0] == "https://www.mojidict.com/assets/app.js");
+    assert(urls[1] == "https://cdn.example.com/vendor.js");
+}
+
+DEFINE_TEST(test_build_search_payload_matches_expected_union_api_shape) {
+    const json payload = bridge_http::build_search_payload("bridge");
+
+    assert(payload["functions"].is_array());
+    assert(payload["functions"].size() == 1);
+    assert(payload["functions"][0]["name"] == "search-all");
+    assert(payload["functions"][0]["params"]["text"] == "bridge");
+    assert(payload["functions"][0]["params"]["types"] == json::array({102, 106}));
+}
+
+DEFINE_TEST(test_transform_details_response_shapes_words_for_local_clients) {
+    const json response = json{{"result", json{{"result", json::array({
+        json{
+            {"word", json{{"objectId", "word-1"}, {"spell", "spell-1"}, {"pron", "pron-1"}, {"accent", "1"}, {"excerpt", "to see"}}},
+            {"details", json::array({json{{"objectId", "detail-1"}, {"title", "Meaning"}}})},
+            {"subdetails", json::array({json{{"objectId", "sub-1"}, {"title", "Primary"}, {"detailsId", "detail-1"}}})},
+            {"examples", json::array({json{{"objectId", "example-1"}, {"title", "Example title"}, {"trans", "example"}, {"subdetailsId", "sub-1"}}})}
+        }
+    })}}}};
+
+    const json transformed = bridge_http::transform_details_response(response);
+
+    assert(transformed["words"].is_array());
+    assert(transformed["words"].size() == 1);
+    assert(transformed["words"][0]["id"] == "word-1");
+    assert(transformed["words"][0]["spell"] == "spell-1");
+    assert(transformed["words"][0]["details"][0]["id"] == "detail-1");
+    assert(transformed["words"][0]["subDetails"][0]["detailId"] == "detail-1");
+    assert(transformed["words"][0]["subDetails"][0]["examples"][0]["id"] == "example-1");
+}
+
+DEFINE_TEST(test_dispatch_local_request_returns_healthcheck_text) {
+    net::io_context ioc;
+    std::optional<bridge_http::LocalHttpResponse> response;
+    bool ensure_ready_called = false;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            response = co_await bridge_http::dispatch_local_request(
+                bridge_http::http::verb::get,
+                "/healthcheck",
+                "",
+                "0.1.1",
+                [&ensure_ready_called]() -> net::awaitable<void> {
+                    ensure_ready_called = true;
+                    co_return;
+                },
+                [](std::string, json) -> net::awaitable<json> {
+                    assert(false);
+                    co_return json::object();
+                });
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(response.has_value());
+    assert(!ensure_ready_called);
+    assert(response->status == bridge_http::http::status::ok);
+    assert(response->body == "version=0.1.1");
+}
+
+DEFINE_TEST(test_dispatch_local_request_proxies_search_payload_and_response) {
+    net::io_context ioc;
+    std::optional<bridge_http::LocalHttpResponse> response;
+    bool ensure_ready_called = false;
+    std::string captured_url;
+    json captured_payload;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            response = co_await bridge_http::dispatch_local_request(
+                bridge_http::http::verb::post,
+                "/search",
+                R"({"query":"dictionary","expand":false})",
+                "0.1.1",
+                [&ensure_ready_called]() -> net::awaitable<void> {
+                    ensure_ready_called = true;
+                    co_return;
+                },
+                [&captured_url, &captured_payload](std::string url, json payload) -> net::awaitable<json> {
+                    captured_url = std::move(url);
+                    captured_payload = std::move(payload);
+                    json proxy_response;
+                    proxy_response["result"]["results"]["search-all"]["items"] = json::array({json{{"id", "entry-1"}}});
+                    co_return proxy_response;
+                });
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(ensure_ready_called);
+    assert(captured_url == "https://api.mojidict.com/parse/functions/union-api");
+    assert(captured_payload == bridge_http::build_search_payload("dictionary"));
+    assert(response.has_value());
+    assert(response->status == bridge_http::http::status::ok);
+
+    const json response_json = json::parse(response->body);
+    assert(response_json["items"].is_array());
+    assert(response_json["items"][0]["id"] == "entry-1");
+}
+
+DEFINE_TEST(test_dispatch_local_request_proxies_details_and_transforms_response) {
+    net::io_context ioc;
+    std::optional<bridge_http::LocalHttpResponse> response;
+    json captured_payload;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            response = co_await bridge_http::dispatch_local_request(
+                bridge_http::http::verb::post,
+                "/details",
+                R"({"objectIds":["word-1"]})",
+                "0.1.1",
+                []() -> net::awaitable<void> {
+                    co_return;
+                },
+                [&captured_payload](std::string, json payload) -> net::awaitable<json> {
+                    captured_payload = std::move(payload);
+                    json proxy_response = json{{"result", json{{"result", json::array({
+                        json{
+                            {"word", json{{"objectId", "word-1"}, {"spell", "bridge-spell"}}},
+                            {"details", json::array({json{{"objectId", "detail-1"}, {"title", "bridge"}}})},
+                            {"subdetails", json::array()},
+                            {"examples", json::array()}
+                        }
+                    })}}}};
+                    co_return proxy_response;
+                });
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(captured_payload == bridge_http::build_details_payload({"word-1"}));
+    assert(response.has_value());
+    assert(response->status == bridge_http::http::status::ok);
+
+    const json response_json = json::parse(response->body);
+    assert(response_json["words"].size() == 1);
+    assert(response_json["words"][0]["id"] == "word-1");
+    assert(response_json["words"][0]["details"][0]["title"] == "bridge");
+}
+
+DEFINE_TEST(test_initialize_http_service_warms_up_remote_dependencies_before_requests) {
+    net::io_context ioc;
+    bool ensure_ready_called = false;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            co_await bridge_http::initialize_http_service(
+                [&ensure_ready_called]() -> net::awaitable<void> {
+                    ensure_ready_called = true;
+                    co_return;
+                });
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(ensure_ready_called);
 }
 
 DEFINE_TEST(test_parse_bridge_settings_rejects_invalid_port) {
@@ -247,6 +448,28 @@ DEFINE_TEST(test_local_session_manager_rearms_idle_timeout_after_last_disconnect
 
     ioc.restart();
     ioc.run();
+
+    assert(idle_timeout_triggered);
+}
+
+DEFINE_TEST(test_local_session_manager_last_disconnect_triggers_immediate_idle_timeout_after_rearm) {
+    net::io_context ioc;
+    bool idle_timeout_triggered = false;
+
+    LocalSessionManager manager(
+        ioc.get_executor(),
+        std::chrono::milliseconds(50),
+        [&]() {
+            idle_timeout_triggered = true;
+        });
+
+    auto socket = std::make_shared<tcp::socket>(ioc);
+    socket->open(tcp::v4());
+    const auto session = manager.register_socket(socket);
+
+    assert(!idle_timeout_triggered);
+
+    manager.unregister(session);
 
     assert(idle_timeout_triggered);
 }

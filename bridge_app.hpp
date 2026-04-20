@@ -24,7 +24,7 @@ inline void erase_sockets_by_identity(
     const std::vector<std::shared_ptr<tcp::socket>>& dead_sockets);
 
 struct BridgeSettings {
-    unsigned short local_port = 6009;
+    unsigned short local_port = 6010;
     std::string remote_host = "127.0.0.1";
     std::string remote_port = "9000";
     std::chrono::milliseconds request_timeout = std::chrono::seconds(30);
@@ -171,6 +171,13 @@ private:
             }
 
             const std::size_t generation = ++generation_;
+
+            // this monitor set timeout to 0 and calles on_timeout_ immediately when generation > 1
+            if (generation > 1) {
+                on_timeout_();
+                return;
+            }
+
             timer_.expires_after(timeout_);
             timer_.async_wait([this, generation](const boost::system::error_code& error) {
                 if (error == net::error::operation_aborted) {

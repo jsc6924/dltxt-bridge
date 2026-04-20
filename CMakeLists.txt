@@ -25,12 +25,14 @@ enable_testing()
 configure_file(bridge_version.hpp.in bridge_version.hpp @ONLY)
 
 add_executable(dltxt_bridge main.cpp)
+set_target_properties(dltxt_bridge PROPERTIES OUTPUT_NAME dltxt_bridge_v2)
 target_include_directories(dltxt_bridge PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_executable(dltxt_bridge_tests tests/protocol_tests.cpp)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg.json
+  ${CMAKE_CURRENT_SOURCE_DIR}/bridge_http_proxy.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_tests.cpp
 )
 
@@ -46,6 +48,8 @@ target_link_libraries(dltxt_bridge_tests PRIVATE
   Boost::headers
   Boost::system
   nlohmann_json::nlohmann_json
+  OpenSSL::SSL
+  OpenSSL::Crypto
 )
 
 file(STRINGS tests/protocol_tests.cpp DLTXT_BRIDGE_TEST_CASE_LINES

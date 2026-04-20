@@ -23,7 +23,7 @@ When the Go backend is down, the loop spins at CPU speed flooding stderr.
 Fix: exponential backoff capped at ~30 s.
 
 7. Host and ports are hardcoded — main.cpp
-Local port 6009, remote "127.0.0.1" / "9000" are string/integer literals.
+Local port 6010, remote "127.0.0.1" / "9000" are string/integer literals.
 Fix: read from CLI arguments.
 
 8. No request timeout — ResponseManager

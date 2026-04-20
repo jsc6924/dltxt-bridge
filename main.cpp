@@ -4,6 +4,7 @@
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/ssl.hpp>
 #include "bridge_app.hpp"
+#include "bridge_http_proxy.hpp"
 #include "bridge_protocol.hpp"
 #include "bridge_runtime.hpp"
 #include "bridge_version.hpp"
@@ -379,9 +380,10 @@ int main(int argc, char* argv[]) {
                 ioc.stop();
             });
         auto response_manager = std::make_shared<ResponseManager>();
+        auto http_proxy_service = std::make_shared<bridge_http::MojiProxyService>(ioc.get_executor(), dltxt_bridge::version);
 
         // Launch ONE coordinator coroutine to handle startup order
-        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, settings]() mutable -> net::awaitable<void> {
+        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, http_proxy_service, settings]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
             net::co_spawn(ex, listener(settings.local_port, remote_registry, session_manager, response_manager, settings.request_timeout), net::detached);
 
@@ -426,9 +428,11 @@ int main(int argc, char* argv[]) {
                     }
                 }
             );
-            
             co_return;
         }, net::detached);
+
+        
+        net::co_spawn(ioc, bridge_http::http_listener(bridge_http::local_http_port, http_proxy_service), net::detached);
 
         ioc.run();
     } catch (const std::invalid_argument& e) {
