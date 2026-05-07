@@ -25,10 +25,11 @@ enable_testing()
 configure_file(bridge_version.hpp.in bridge_version.hpp @ONLY)
 
 add_executable(dltxt_bridge main.cpp)
-set_target_properties(dltxt_bridge PROPERTIES OUTPUT_NAME dltxt_bridge_v2)
+set_target_properties(dltxt_bridge PROPERTIES OUTPUT_NAME dltxt_bridge_v3)
 target_include_directories(dltxt_bridge PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_executable(dltxt_bridge_tests tests/protocol_tests.cpp)
+target_include_directories(dltxt_bridge_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg.json

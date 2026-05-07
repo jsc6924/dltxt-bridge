@@ -104,10 +104,29 @@ DEFINE_TEST(test_parse_content_length_too_large) {
     assert(!parsed.has_value());
 }
 
+DEFINE_TEST(test_read_message_blocking_parses_chunked_message) {
+    beast::flat_buffer buffer;
+    const std::string payload = R"({"jsonrpc":"2.0","method":"initialize"})";
+    const std::string framed = lsp::frame_message(payload);
+    std::size_t offset = 0;
+
+    const auto message = lsp::read_message_blocking(
+        [&](char* data, std::size_t size) -> std::pair<boost::system::error_code, std::size_t> {
+            const std::size_t remaining = framed.size() - offset;
+            const std::size_t chunk_size = (std::min)(size, (std::min)(remaining, static_cast<std::size_t>(5)));
+            std::copy_n(framed.data() + offset, chunk_size, data);
+            offset += chunk_size;
+            return {{}, chunk_size};
+        },
+        buffer);
+
+    assert(message.has_value());
+    assert(*message == payload);
+}
+
 DEFINE_TEST(test_parse_bridge_settings_defaults) {
     const BridgeSettings settings = parse_bridge_settings({});
 
-    assert(settings.local_port == 6010);
     assert(settings.remote_host == "127.0.0.1");
     assert(settings.remote_port == "9000");
     assert(settings.request_timeout == std::chrono::seconds(30));
@@ -116,13 +135,11 @@ DEFINE_TEST(test_parse_bridge_settings_defaults) {
 
 DEFINE_TEST(test_parse_bridge_settings_overrides) {
     const BridgeSettings settings = parse_bridge_settings({
-        "--listen-port", "6010",
         "--remote-host", "example.com",
         "--remote-port", "9010",
         "--request-timeout-ms", "1500"
     });
 
-    assert(settings.local_port == 6010);
     assert(settings.remote_host == "example.com");
     assert(settings.remote_port == "9010");
     assert(settings.request_timeout == std::chrono::milliseconds(1500));
@@ -133,16 +150,12 @@ DEFINE_TEST(test_parse_bridge_settings_version_flag) {
     const BridgeSettings settings = parse_bridge_settings({"--version"});
 
     assert(settings.show_version);
-    assert(settings.local_port == 6010);
     assert(settings.remote_host == "127.0.0.1");
     assert(settings.remote_port == "9000");
 }
 
-DEFINE_TEST(test_local_http_proxy_uses_fixed_port_distinct_from_lsp_listener) {
-    const BridgeSettings settings = parse_bridge_settings({});
-
+DEFINE_TEST(test_local_http_proxy_uses_fixed_port) {
     assert(bridge_http::local_http_port == 9286);
-    assert(bridge_http::local_http_port != settings.local_port);
 }
 
 DEFINE_TEST(test_extract_application_id_from_script_asset) {
@@ -337,11 +350,11 @@ DEFINE_TEST(test_initialize_http_service_warms_up_remote_dependencies_before_req
     assert(ensure_ready_called);
 }
 
-DEFINE_TEST(test_parse_bridge_settings_rejects_invalid_port) {
+DEFINE_TEST(test_parse_bridge_settings_rejects_legacy_listen_port_argument) {
     bool threw = false;
 
     try {
-        static_cast<void>(parse_bridge_settings({"--listen-port", "70000"}));
+        static_cast<void>(parse_bridge_settings({"--listen-port", "6010"}));
     } catch (const std::invalid_argument&) {
         threw = true;
     }
@@ -356,49 +369,17 @@ DEFINE_TEST(test_bridge_signal_numbers_include_shutdown_signals) {
     assert(std::find(signals.begin(), signals.end(), SIGTERM) != signals.end());
 }
 
-DEFINE_TEST(test_socket_helpers_identify_and_prune_dead_sockets) {
-    net::io_context ioc;
-
-    auto live_socket = std::make_shared<tcp::socket>(ioc);
-    live_socket->open(tcp::v4());
-
-    auto dead_socket = std::make_shared<tcp::socket>(ioc);
-    std::vector<std::shared_ptr<LocalSession>> sessions{std::make_shared<LocalSession>(std::move(*live_socket)), std::make_shared<LocalSession>(std::move(*dead_socket))};
-
-    assert(!socket_is_dead(live_socket));
-    assert(socket_is_dead(dead_socket));
-
-    erase_sockets_by_identity(sessions, {dead_socket});
-
-    assert(sessions.size() == 1);
-    assert(sessions.front()->get_socket().get() == live_socket.get());
-}
-
-DEFINE_TEST(test_local_session_equality_compares_by_socket_identity) {
-    net::io_context ioc;
-
-    tcp::socket raw_a(ioc);
-    tcp::socket raw_b(ioc);
-
-    // Capture the raw pointer before the socket is moved into the session
-    const auto session_a = std::make_shared<LocalSession>(std::move(raw_a));
-    const auto session_b = std::make_shared<LocalSession>(std::move(raw_b));
-    const auto session_a_alias = session_a;
-
-    assert(*session_a == *session_a_alias);
-    assert(!(*session_a == *session_b));
-}
-
-DEFINE_TEST(test_local_session_manager_register_socket_preserves_shared_socket_identity) {
+DEFINE_TEST(test_local_session_manager_register_session_preserves_identity) {
     net::io_context ioc;
     LocalSessionManager manager;
     auto socket = std::make_shared<tcp::socket>(ioc);
     socket->open(tcp::v4());
+    auto expected_session = std::make_shared<LocalSession>(socket);
 
-    const auto session = manager.register_socket(socket);
+    const auto session = manager.register_session(expected_session);
 
     assert(manager.session_count() == 1);
-    assert(session->get_socket() == socket);
+    assert(session == expected_session);
 }
 
 DEFINE_TEST(test_local_session_manager_stops_when_idle_timeout_expires) {
@@ -432,7 +413,7 @@ DEFINE_TEST(test_local_session_manager_rearms_idle_timeout_after_last_disconnect
 
     auto socket = std::make_shared<tcp::socket>(ioc);
     socket->open(tcp::v4());
-    const auto session = manager.register_socket(socket);
+    const auto session = manager.register_session(std::make_shared<LocalSession>(socket));
 
     net::steady_timer probe_timer(ioc);
     probe_timer.expires_after(std::chrono::milliseconds(2));
@@ -465,7 +446,7 @@ DEFINE_TEST(test_local_session_manager_last_disconnect_triggers_immediate_idle_t
 
     auto socket = std::make_shared<tcp::socket>(ioc);
     socket->open(tcp::v4());
-    const auto session = manager.register_socket(socket);
+    const auto session = manager.register_session(std::make_shared<LocalSession>(socket));
 
     assert(!idle_timeout_triggered);
 
@@ -485,7 +466,7 @@ DEFINE_TEST(test_remote_notification_forwarder_broadcasts_to_local_clients) {
 
     auto server_socket = std::make_shared<tcp::socket>(ioc);
     acceptor.accept(*server_socket);
-    session_manager->register_socket(server_socket);
+    session_manager->register_session(std::make_shared<LocalSession>(server_socket));
 
     const std::string payload = R"({"jsonrpc":"2.0","method":"simpletm/progress","params":{"project_id":"demo"}})";
     std::optional<std::optional<std::string>> received_message;
@@ -559,14 +540,15 @@ DEFINE_TEST(test_local_session_write_framed_serializes_overlapping_writes) {
     assert(**second_received == second_payload);
 }
 
-DEFINE_TEST(test_close_socket_if_open_closes_socket) {
+DEFINE_TEST(test_local_session_close_closes_socket) {
     net::io_context ioc;
     auto socket = std::make_shared<tcp::socket>(ioc);
     socket->open(tcp::v4());
+    LocalSession session(socket);
 
     assert(socket->is_open());
 
-    close_socket_if_open(socket);
+    session.close();
 
     assert(!socket->is_open());
 }
@@ -680,6 +662,28 @@ DEFINE_TEST(test_local_handler_closes_session_on_exit_notification) {
     assert(!handling.forward_to_remote);
     assert(!handling.response.has_value());
     assert(handling.directive == bridge_local::SessionDirective::close_session);
+}
+
+DEFINE_TEST(test_local_handler_returns_dltxt_version_response) {
+    const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "dltxt/version"}};
+    const auto handling = bridge_local::handle_request(nullptr, request);
+
+    assert(!handling.forward_to_remote);
+    assert(handling.response.has_value());
+    assert((*handling.response)["jsonrpc"] == "2.0");
+    assert((*handling.response)["id"] == 1);
+    assert((*handling.response)["result"].is_object());
+    assert((*handling.response)["result"]["version"] == dltxt_bridge::version);
+    assert(handling.directive == bridge_local::SessionDirective::none);
+}
+
+DEFINE_TEST(test_local_handler_swallows_dltxt_version_notification_without_id) {
+    const json request = json{{"jsonrpc", "2.0"}, {"method", "dltxt/version"}};
+    const auto handling = bridge_local::handle_request(nullptr, request);
+
+    assert(!handling.forward_to_remote);
+    assert(!handling.response.has_value());
+    assert(handling.directive == bridge_local::SessionDirective::none);
 }
 
 DEFINE_TEST(test_response_manager_round_trip) {

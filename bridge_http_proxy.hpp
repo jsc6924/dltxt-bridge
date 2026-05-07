@@ -334,7 +334,7 @@ net::awaitable<LocalHttpResponse> dispatch_local_request(
     RemotePostFn&& remote_post) {
 
     if (target == "/healthcheck") {
-        printf("[http] /healthcheck\n");
+        fprintf(stderr, "[http] /healthcheck\n");
         co_return make_text_response(http::status::ok, "version=" + std::string(version));
     }
 
@@ -356,7 +356,7 @@ net::awaitable<LocalHttpResponse> dispatch_local_request(
 
     try {
         if (target == "/search") {
-            printf("[http] /search %s\n", body.data());
+            fprintf(stderr, "[http] /search %s\n", body.data());
             const std::string query = json_string_field(request_body, "query");
             json proxy_response = co_await remote_post(
                 "https://api.mojidict.com/parse/functions/union-api",
@@ -371,7 +371,7 @@ net::awaitable<LocalHttpResponse> dispatch_local_request(
         }
 
         if (target == "/details") {
-            printf("[http] /details %s\n", body.data());
+            fprintf(stderr, "[http] /details %s\n", body.data());
             std::vector<std::string> object_ids;
             auto object_ids_it = request_body.find("objectIds");
             if (object_ids_it != request_body.end() && object_ids_it->is_array()) {
@@ -473,12 +473,12 @@ public:
             co_return;
         }
 
-        printf("Fetching Mojidict ApplicationID\n");
+        fprintf(stderr, "Fetching Mojidict ApplicationID\n");
         const std::string root_url = "https://www.mojidict.com/";
         const std::string html = co_await fetch_text(root_url);
         if (auto id = extract_application_id(html); id.has_value()) {
             application_id_ = *id;
-            printf("Fetched Mojidict ApplicationID: %s\n", application_id_.c_str());
+            fprintf(stderr, "Fetched Mojidict ApplicationID: %s\n", application_id_.c_str());
             co_return;
         }
 
@@ -488,7 +488,7 @@ public:
                 const std::string script = co_await fetch_text(script_url);
                 if (auto id = extract_application_id(script); id.has_value()) {
                     application_id_ = *id;
-                    printf("Fetched Mojidict ApplicationID: %s\n", application_id_.c_str());
+                    fprintf(stderr, "Fetched Mojidict ApplicationID: %s\n", application_id_.c_str());
                     co_return;
                 }
             } catch (const std::exception& error) {
@@ -630,7 +630,7 @@ inline net::awaitable<void> http_listener(unsigned short port, std::shared_ptr<M
     auto executor = co_await net::this_coro::executor;
     tcp::acceptor acceptor(executor, tcp::endpoint(net::ip::address_v4::loopback(), port));
 
-    printf("dltxt_bridge HTTP proxy on 127.0.0.1:%u\n", port);
+    fprintf(stderr, "dltxt_bridge HTTP proxy on 127.0.0.1:%u\n", port);
     co_await initialize_http_service([service]() -> net::awaitable<void> {
         co_await service->ensure_application_id();
     });

@@ -12,6 +12,7 @@
 #include <exception>
 #include <memory>
 #include <deque>
+#include <thread>
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -63,7 +64,7 @@ public:
             beast::get_lowest_layer(ssl_ws).expires_after(std::chrono::seconds(30));
             co_await beast::get_lowest_layer(ssl_ws).async_connect(results, net::use_awaitable);
 
-            // Set SNI hostname — required for virtual hosting / Let's Encrypt
+            // Set SNI hostname - required for virtual hosting / Let's Encrypt
             if (!SSL_set_tlsext_host_name(ssl_ws.next_layer().native_handle(), host.c_str())) {
                 beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
                 throw beast::system_error{ec};
@@ -75,7 +76,7 @@ public:
             co_await ssl_ws.async_handshake(host, "/ws", net::use_awaitable);
         }
 
-        printf("Connected to Go Backend at %s:%s\n", host.c_str(), port.c_str());
+        fprintf(stderr, "Connected to Go Backend at %s:%s\n", host.c_str(), port.c_str());
     }
 
     net::awaitable<void> send(std::string message) {
@@ -93,13 +94,13 @@ public:
                 std::string next = std::move(write_queue_.front());
                 write_queue_.pop_front();
 
-                printf("Sending to Go backend: %s\n", next.c_str());
+                fprintf(stderr, "Sending to Go backend: %s\n", next.c_str());
                 if (auto* plain = std::get_if<PlainWs>(&ws_)) {
                     co_await plain->async_write(net::buffer(next), net::use_awaitable);
                 } else {
                     co_await std::get<SslWs>(ws_).async_write(net::buffer(next), net::use_awaitable);
                 }
-                printf("Message sent to Go backend\n");
+                fprintf(stderr, "Message sent to Go backend\n");
             }
         } catch (...) {
             write_in_progress_ = false;
@@ -124,9 +125,8 @@ public:
 
 net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session, std::shared_ptr<RemoteRegistry> remote_registry) {
     try {
-        auto socket = session->get_socket();
         while (session->is_open()) {
-            net::steady_timer timer(socket->get_executor());
+            net::steady_timer timer(session->get_executor());
             timer.expires_after(std::chrono::seconds(10));
             co_await timer.async_wait(net::use_awaitable);
 
@@ -148,7 +148,6 @@ net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session, std::
 }
 
 net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message) {
-    printf("[response] %s\n", message.dump().c_str());
     std::string framed = lsp::frame_message(message.dump());
     co_await session->write_framed(std::move(framed));
 }
@@ -157,35 +156,123 @@ net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& sessi
     co_await write_json_message(session, jsonrpc::create_error(id, code, message));
 }
 
+class LocalInputQueue {
+    net::steady_timer signal_;
+    std::deque<std::string> messages_;
+    std::exception_ptr error_;
+    bool closed_ = false;
+
+public:
+    explicit LocalInputQueue(net::any_io_executor executor)
+        : signal_(executor) {
+        signal_.expires_at((std::chrono::steady_clock::time_point::max)());
+    }
+
+    void push(std::string message) {
+        if (closed_) {
+            return;
+        }
+
+        messages_.push_back(std::move(message));
+        signal_.cancel_one();
+    }
+
+    void close() {
+        if (closed_) {
+            return;
+        }
+
+        closed_ = true;
+        signal_.cancel();
+    }
+
+    void fail(std::exception_ptr error) {
+        error_ = error;
+        closed_ = true;
+        signal_.cancel();
+    }
+
+    net::awaitable<std::optional<std::string>> wait_and_pop() {
+        for (;;) {
+            if (!messages_.empty()) {
+                std::string message = std::move(messages_.front());
+                messages_.pop_front();
+                co_return message;
+            }
+
+            if (error_) {
+                std::rethrow_exception(error_);
+            }
+
+            if (closed_) {
+                co_return std::nullopt;
+            }
+
+            signal_.expires_at((std::chrono::steady_clock::time_point::max)());
+            auto [error] = co_await signal_.async_wait(net::as_tuple(net::use_awaitable));
+            if (error && error != net::error::operation_aborted) {
+                throw boost::system::system_error(error);
+            }
+        }
+    }
+};
+
+void start_stdio_reader_thread(
+    net::any_io_executor executor,
+    std::shared_ptr<StdioHandle> input_handle,
+    std::shared_ptr<LocalInputQueue> input_queue) {
+
+    std::thread([executor, input_handle = std::move(input_handle), input_queue = std::move(input_queue)]() mutable {
+        beast::flat_buffer buffer;
+
+        try {
+            for (;;) {
+                auto maybe_message = lsp::read_message_blocking(
+                    [&input_handle](char* data, std::size_t size) {
+                        return input_handle->read_some(data, size);
+                    },
+                    buffer);
+
+                if (!maybe_message.has_value()) {
+                    net::post(executor, [input_queue]() {
+                        input_queue->close();
+                    });
+                    return;
+                }
+
+                net::post(executor, [input_queue, message = std::move(*maybe_message)]() mutable {
+                    input_queue->push(std::move(message));
+                });
+            }
+        } catch (...) {
+            auto error = std::current_exception();
+            net::post(executor, [input_queue, error]() {
+                input_queue->fail(error);
+            });
+        }
+    }).detach();
+}
+
 net::awaitable<void> handle_local_session(
-    tcp::socket socket, 
+    std::shared_ptr<LocalInputQueue> input_queue,
+    std::shared_ptr<LocalSession> session,
     std::shared_ptr<RemoteRegistry> remote_registry,
     std::shared_ptr<LocalSessionManager> session_manager,
     std::shared_ptr<ResponseManager> response_manager,
     std::chrono::milliseconds request_timeout) {
-    
-    auto socket_ptr = std::make_shared<tcp::socket>(std::move(socket));
-    boost::system::error_code endpoint_error;
-    const auto remote_endpoint = socket_ptr->remote_endpoint(endpoint_error);
-    auto session = session_manager->register_socket(socket_ptr);
-
-    if (!endpoint_error) {
-        printf("Accepted local client %s:%u\n", remote_endpoint.address().to_string().c_str(), remote_endpoint.port());
-    } else {
-        fprintf(stderr, "Accepted local client with unknown endpoint: %s\n", endpoint_error.message().c_str());
-    }
+    fprintf(stderr, "Accepted local stdio session\n");
     
     beast::flat_buffer buffer;
     bool shutdown_requested = false;
 
-    net::co_spawn(socket_ptr->get_executor(), heartbeat_loop(session, remote_registry), net::detached);
+    net::co_spawn(session->get_executor(), heartbeat_loop(session, remote_registry), net::detached);
     
     try {
         for (;;) {
-            auto maybe_message = co_await lsp::read_message(*socket_ptr, buffer);
+            auto maybe_message = co_await input_queue->wait_and_pop();
             if (!maybe_message.has_value()) {
-                fprintf(stderr, "Invalid LSP header received\n");
-                continue;
+                fprintf(stderr, "Local stdio input closed\n");
+                break;
             }
 
             std::string msg_str = std::move(*maybe_message);
@@ -221,7 +308,7 @@ net::awaitable<void> handle_local_session(
                 continue;
             }
             
-            printf("JSON-RPC Request: %s\n", request.dump().c_str());
+            fprintf(stderr, "JSON-RPC Request: %s\n", request.dump().c_str());
 
             auto local_handling = bridge_local::handle_request(session, request);
             if (!local_handling.forward_to_remote) {
@@ -232,12 +319,12 @@ net::awaitable<void> handle_local_session(
                 if (local_handling.directive == bridge_local::SessionDirective::mark_shutdown_requested) {
                     shutdown_requested = true;
                 } else if (local_handling.directive == bridge_local::SessionDirective::close_session) {
-                    printf(
+                    fprintf(stderr,
                         shutdown_requested
                             ? "Closing local session after exit notification following shutdown\n"
                             : "Closing local session after exit notification without prior shutdown\n"
                     );
-                    close_socket_if_open(socket_ptr);
+                    session->close();
                     session_manager->unregister(session);
                     co_return;
                 }
@@ -287,13 +374,11 @@ net::awaitable<void> handle_local_session(
             }
         }
     } catch (...) { 
-        /* Handle disconnect */ 
-        if (!endpoint_error) {
-            printf("Closing local client %s:%u\n", remote_endpoint.address().to_string().c_str(), remote_endpoint.port());
-        }
-        close_socket_if_open(socket_ptr);
-        session_manager->unregister(session);
+        fprintf(stderr, "Closing local stdio session after transport failure\n");
     }
+
+    session->close();
+    session_manager->unregister(session);
 }
 // Remote reader coroutine: continuously receives from Go backend and broadcasts to all local sessions
 net::awaitable<void> remote_reader(
@@ -304,7 +389,7 @@ net::awaitable<void> remote_reader(
     try {
         for (;;) {
             std::string message = co_await remote->receive();
-            printf("Received from Go backend: %s\n", message.c_str());
+            fprintf(stderr, "Received from Go backend: %s\n", message.c_str());
             
             // Parse as JSON-RPC if possible
             bool is_json = false;
@@ -338,33 +423,13 @@ net::awaitable<void> remote_reader(
         throw;
     }
 }
-// Coroutine to listen for new VS Code windows
-net::awaitable<void> listener(
-    unsigned short port, 
-    std::shared_ptr<RemoteRegistry> remote_registry,
-    std::shared_ptr<LocalSessionManager> session_manager,
-    std::shared_ptr<ResponseManager> response_manager,
-    std::chrono::milliseconds request_timeout) {
-    auto executor = co_await net::this_coro::executor;
-    tcp::acceptor acceptor(executor, {tcp::v4(), port});
-    
-    printf("dltxt_bridge (Coroutine mode) on port %u - JSON-RPC Language Server\n", port);
-
-    for (;;) {
-        tcp::socket socket = co_await acceptor.async_accept(net::use_awaitable);
-
-        net::co_spawn(socket.get_executor(), 
-            handle_local_session(std::move(socket), remote_registry, session_manager, response_manager, request_timeout), 
-            net::detached);
-    }
-}
 
 int main(int argc, char* argv[]) {
     try {
         configure_stdio_for_immediate_flush();
         const BridgeSettings settings = parse_bridge_settings(argc, argv);
         if (settings.show_version) {
-            printf("dltxt_bridge %s\n", dltxt_bridge::version);
+            printf("dltxt_bridge_v3 %s\n", dltxt_bridge::version);
             return 0;
         }
 
@@ -372,20 +437,18 @@ int main(int argc, char* argv[]) {
         auto stop_signals = install_stop_signals(ioc);
 
         auto remote_registry = std::make_shared<RemoteRegistry>();
-        auto session_manager = std::make_shared<LocalSessionManager>(
-            ioc.get_executor(),
-            std::chrono::minutes(15),
-            [&ioc]() {
-                printf("No local sessions connected for 15 minutes; shutting down bridge\n");
-                ioc.stop();
-            });
+        auto session_manager = std::make_shared<LocalSessionManager>();
         auto response_manager = std::make_shared<ResponseManager>();
         auto http_proxy_service = std::make_shared<bridge_http::MojiProxyService>(ioc.get_executor(), dltxt_bridge::version);
+        auto local_input = open_stdio_input_handle();
+        auto local_input_queue = std::make_shared<LocalInputQueue>(ioc.get_executor());
+        auto local_session = session_manager->register_session(std::make_shared<LocalSession>(ioc.get_executor(), open_stdio_output_handle()));
+        start_stdio_reader_thread(ioc.get_executor(), local_input, local_input_queue);
 
         // Launch ONE coordinator coroutine to handle startup order
-        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, http_proxy_service, settings]() mutable -> net::awaitable<void> {
+        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, local_input_queue, local_session, settings]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
-            net::co_spawn(ex, listener(settings.local_port, remote_registry, session_manager, response_manager, settings.request_timeout), net::detached);
+            net::co_spawn(ex, handle_local_session(local_input_queue, local_session, remote_registry, session_manager, response_manager, settings.request_timeout), net::detached);
 
             co_await run_remote_retry_loop(
                 remote_registry,
@@ -437,7 +500,7 @@ int main(int argc, char* argv[]) {
         ioc.run();
     } catch (const std::invalid_argument& e) {
         fprintf(stderr, "Configuration Error: %s\n", e.what());
-        fprintf(stderr, "Usage: dltxt_bridge [--listen-port <port>] [--remote-host <host>] [--remote-port <port>] [--request-timeout-ms <ms>] [--version]\n");
+        fprintf(stderr, "Usage: dltxt_bridge_v3 [--remote-host <host>] [--remote-port <port>] [--request-timeout-ms <ms>] [--version]\n");
         return 1;
     } catch (std::exception& e) {
         fprintf(stderr, "Bridge Error: %s\n", e.what());

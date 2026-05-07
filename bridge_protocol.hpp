@@ -5,6 +5,7 @@
 #include <array>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <limits>
 #include <deque>
 #include <cstdint>
@@ -18,6 +19,7 @@
 
 #include <nlohmann/json.hpp>
 #include "local_session.hpp"
+#include "bridge_version.hpp"
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
@@ -85,7 +87,7 @@ template <typename ConstBufferSequence>
 inline void log_buffer_snapshot(const char* label, const ConstBufferSequence& buffers) {
     const std::string buffered = beast::buffers_to_string(buffers);
     const std::string escaped = escape_control_chars(buffered);
-    printf("%s (%zu bytes, escaped): [%s]\n", label, buffered.size(), escaped.c_str());
+    fprintf(stderr, "%s (%zu bytes, escaped): [%s]\n", label, buffered.size(), escaped.c_str());
 }
 
 inline void append_chunk_to_buffer(beast::flat_buffer& buffer, const char* data, std::size_t size) {
@@ -95,11 +97,11 @@ inline void append_chunk_to_buffer(beast::flat_buffer& buffer, const char* data,
 }
 
 inline void log_local_notification(const std::string& method, const json& params = json::object()) {
-    printf("Handled local notification %s: %s\n", method.c_str(), params.dump().c_str());
+    fprintf(stderr, "Handled local notification %s: %s\n", method.c_str(), params.dump().c_str());
 }
 
 inline void log_local_request(const std::string& method, const json& params = json::object()) {
-    printf("Handled local request %s: %s\n", method.c_str(), params.dump().c_str());
+    fprintf(stderr, "Handled local request %s: %s\n", method.c_str(), params.dump().c_str());
 }
 
 template <typename AsyncReadStream>
@@ -114,12 +116,12 @@ net::awaitable<std::size_t> read_chunk(
     );
 
     if (error) {
-        printf("%s\n", error.message().c_str());
+        fprintf(stderr, "%s\n", error.message().c_str());
         throw boost::system::system_error(error);
     }
 
     if (bytes_read == 0) {
-        printf("Read returned 0 bytes\n");
+        fprintf(stderr, "Read returned 0 bytes\n");
         co_return 0;
     }
 
@@ -197,17 +199,17 @@ net::awaitable<std::optional<std::string>> read_message(AsyncReadStream& stream,
         const std::string escaped_header = escape_control_chars(header_block);
 
         if (is_ignorable_header_block(header_block)) {
-            printf("Ignoring blank header block\n");
+            fprintf(stderr, "Ignoring blank header block\n");
             continue;
         }
 
         auto content_length = parse_content_length(header_block);
         if (!content_length.has_value()) {
-            printf("Invalid header block, unable to parse Content-Length\n");
+            fprintf(stderr, "Invalid header block, unable to parse Content-Length\n");
             co_return std::nullopt;
         }
 
-        printf("Parsed Content-Length: %zu\n", *content_length);
+        fprintf(stderr, "Parsed Content-Length: %zu\n", *content_length);
 
         while (buffer.size() < *content_length) {
             const auto bytes_read = co_await read_chunk(
@@ -221,10 +223,76 @@ net::awaitable<std::optional<std::string>> read_message(AsyncReadStream& stream,
         }
 
         std::string payload = beast::buffers_to_string(beast::buffers_prefix(*content_length, buffer.data()));
-        printf("Received payload (%zu bytes):\n%s\n", payload.size(), payload.c_str());
+        fprintf(stderr, "Received payload (%zu bytes):\n%s\n", payload.size(), payload.c_str());
         buffer.consume(*content_length);
         
         co_return payload;
+    }
+}
+
+template <typename BlockingReadSomeFn>
+std::optional<std::string> read_message_blocking(BlockingReadSomeFn&& read_some, beast::flat_buffer& buffer) {
+    for (;;) {
+        while (!header_block_length(buffer.data()).has_value()) {
+            std::array<char, 4096> chunk{};
+            auto [error, bytes_read] = read_some(chunk.data(), chunk.size());
+
+            if (error) {
+                fprintf(stderr, "%s\n", error.message().c_str());
+                throw boost::system::system_error(error);
+            }
+
+            if (bytes_read == 0) {
+                fprintf(stderr, "Read returned 0 bytes\n");
+                return std::nullopt;
+            }
+
+            append_chunk_to_buffer(buffer, chunk.data(), bytes_read);
+        }
+
+        const auto header_bytes = header_block_length(buffer.data());
+        if (!header_bytes.has_value()) {
+            log_buffer_snapshot("Unable to find header delimiter in buffered bytes", buffer.data());
+            return std::nullopt;
+        }
+
+        std::string header_block = beast::buffers_to_string(beast::buffers_prefix(*header_bytes, buffer.data()));
+        buffer.consume(*header_bytes);
+
+        if (is_ignorable_header_block(header_block)) {
+            fprintf(stderr, "Ignoring blank header block\n");
+            continue;
+        }
+
+        auto content_length = parse_content_length(header_block);
+        if (!content_length.has_value()) {
+            fprintf(stderr, "Invalid header block, unable to parse Content-Length\n");
+            return std::nullopt;
+        }
+
+        fprintf(stderr, "Parsed Content-Length: %zu\n", *content_length);
+
+        while (buffer.size() < *content_length) {
+            std::array<char, 4096> chunk{};
+            auto [error, bytes_read] = read_some(chunk.data(), chunk.size());
+
+            if (error) {
+                fprintf(stderr, "%s\n", error.message().c_str());
+                throw boost::system::system_error(error);
+            }
+
+            if (bytes_read == 0) {
+                return std::nullopt;
+            }
+
+            append_chunk_to_buffer(buffer, chunk.data(), bytes_read);
+        }
+
+        std::string payload = beast::buffers_to_string(beast::buffers_prefix(*content_length, buffer.data()));
+        fprintf(stderr, "Received payload (%zu bytes):\n%s\n", payload.size(), payload.c_str());
+        buffer.consume(*content_length);
+
+        return payload;
     }
 }
 }
@@ -422,10 +490,21 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
 
         const json params = request.value("params", json::object());
         const std::string message = params.value("message", "");
-        printf("Echoing message from client: %s\n", message.c_str());
+        fprintf(stderr, "Echoing message from client: %s\n", message.c_str());
 
         return RequestResult::local_response(
             jsonrpc::create_response(request["id"], json{{"result", message}})
+        );
+    }
+
+    if (method == "dltxt/version") {
+        if (!request.contains("id")) {
+            return {};
+        }
+
+        fprintf(stderr, "Responding to version request from client\n");
+        return RequestResult::local_response(
+            jsonrpc::create_response(request["id"], json{{"version", dltxt_bridge::version}})
         );
     }
 
@@ -434,14 +513,14 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
     }
 
     if (method == "initialize") {
-        printf("Handled initialize request %s locally\n", request["id"].dump().c_str());
+        fprintf(stderr, "Handled initialize request %s locally\n", request["id"].dump().c_str());
         return RequestResult::local_response(
             jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}})
         );
     }
 
     if (method == "shutdown") {
-        printf("Handled shutdown request %s locally\n", request["id"].dump().c_str());
+        fprintf(stderr, "Handled shutdown request %s locally\n", request["id"].dump().c_str());
         return RequestResult::local_response(
             jsonrpc::create_response(request["id"], nullptr),
             SessionDirective::mark_shutdown_requested

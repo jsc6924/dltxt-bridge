@@ -18,13 +18,8 @@
 #include "bridge_protocol.hpp"
 
 namespace net = boost::asio;
-using tcp = net::ip::tcp;
-inline void erase_sockets_by_identity(
-    std::vector<std::shared_ptr<LocalSession>>& sessions,
-    const std::vector<std::shared_ptr<tcp::socket>>& dead_sockets);
 
 struct BridgeSettings {
-    unsigned short local_port = 6010;
     std::string remote_host = "127.0.0.1";
     std::string remote_port = "9000";
     std::chrono::milliseconds request_timeout = std::chrono::seconds(30);
@@ -52,34 +47,6 @@ inline std::unique_ptr<net::signal_set> install_stop_signals(net::io_context& io
     return signals;
 }
 
-inline bool socket_is_dead(const std::shared_ptr<tcp::socket>& socket) {
-    return !socket || !socket->is_open();
-}
-
-inline void close_socket_if_open(const std::shared_ptr<tcp::socket>& socket) {
-    if (!socket || !socket->is_open()) {
-        return;
-    }
-
-    boost::system::error_code error;
-    socket->shutdown(tcp::socket::shutdown_both, error);
-    socket->close(error);
-}
-
-
-inline unsigned short parse_port_number(const std::string& value, const char* option_name) {
-    try {
-        const auto parsed = std::stoul(value);
-        if (parsed == 0 || parsed > 65535) {
-            throw std::out_of_range("port out of range");
-        }
-
-        return static_cast<unsigned short>(parsed);
-    } catch (...) {
-        throw std::invalid_argument(std::string("Invalid value for ") + option_name + ": " + value);
-    }
-}
-
 inline std::chrono::milliseconds parse_timeout_ms(const std::string& value, const char* option_name) {
     try {
         const auto parsed = std::stoull(value);
@@ -98,15 +65,6 @@ inline BridgeSettings parse_bridge_settings(const std::vector<std::string>& args
 
     for (std::size_t index = 0; index < args.size(); ++index) {
         const std::string& arg = args[index];
-        if (arg == "--listen-port") {
-            if (index + 1 >= args.size()) {
-                throw std::invalid_argument("Missing value for --listen-port");
-            }
-
-            settings.local_port = parse_port_number(args[++index], "--listen-port");
-            continue;
-        }
-
         if (arg == "--remote-host") {
             if (index + 1 >= args.size()) {
                 throw std::invalid_argument("Missing value for --remote-host");
@@ -239,8 +197,8 @@ public:
             idle_timeout,
             std::move(on_idle_timeout))) {}
 
-    std::shared_ptr<LocalSession> register_socket(std::shared_ptr<tcp::socket> socket) {
-        sessions.push_back(std::make_shared<LocalSession>(std::move(socket)));
+    std::shared_ptr<LocalSession> register_session(std::shared_ptr<LocalSession> session) {
+        sessions.push_back(std::move(session));
         on_session_count_changed();
         return sessions.back();
     }
@@ -262,24 +220,30 @@ public:
 
     net::awaitable<void> broadcast(std::string message) {
         std::vector<std::shared_ptr<LocalSession>> sessions_copy = sessions;
-        std::vector<std::shared_ptr<tcp::socket>> dead_sockets;
+        std::vector<std::shared_ptr<LocalSession>> dead_sessions;
         std::string framed_message = lsp::frame_message(message);
 
         for (auto& session : sessions_copy) {
-            auto socket = session->get_socket();
-            if (socket_is_dead(socket)) {
-                dead_sockets.push_back(socket);
+            if (!session->is_open()) {
+                dead_sessions.push_back(session);
                 continue;
             }
 
             try {
                 co_await session->write_framed(framed_message);
             } catch (...) {
-                dead_sockets.push_back(socket);
+                dead_sessions.push_back(session);
             }
         }
 
-        erase_sockets_by_identity(sessions, dead_sockets);
+        if (!dead_sessions.empty()) {
+            sessions.erase(
+                std::remove_if(sessions.begin(), sessions.end(),
+                    [&dead_sessions](const std::shared_ptr<LocalSession>& current) {
+                        return std::find(dead_sessions.begin(), dead_sessions.end(), current) != dead_sessions.end();
+                    }),
+                sessions.end());
+        }
         on_session_count_changed();
     }
 };
@@ -345,7 +309,7 @@ inline net::awaitable<void> remote_notification_forwarder(
                 co_return;
             }
 
-            printf("Forwarding remote notification to local clients: %s\n", message->c_str());
+            fprintf(stderr, "Forwarding remote notification to local clients: %s\n", message->c_str());
             co_await session_manager->broadcast(*message);
         }
     } catch (const std::exception& e) {
