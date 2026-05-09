@@ -3,6 +3,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -12,6 +14,7 @@
 
 #include "../local_session.hpp"
 #include "../bridge_app.hpp"
+#include "../bridge_documents.hpp"
 #include "../bridge_http_proxy.hpp"
 #include "../bridge_protocol.hpp"
 #include "../bridge_runtime.hpp"
@@ -34,6 +37,10 @@ struct TestRegistrar {
         registered_tests().push_back(NamedTest{name, fn});
     }
 };
+
+std::string utf8_bytes(const char* text) {
+    return std::string(text);
+}
 
 #define DEFINE_TEST(name) \
     void name(); \
@@ -605,7 +612,8 @@ DEFINE_TEST(test_local_initialize_request_returns_empty_capabilities) {
     assert((*handling.response)["jsonrpc"] == "2.0");
     assert((*handling.response)["id"] == 1);
     assert((*handling.response)["result"].is_object());
-    assert((*handling.response)["result"]["capabilities"] == json::object());
+    assert((*handling.response)["result"]["capabilities"]["textDocumentSync"]["openClose"] == true);
+    assert((*handling.response)["result"]["capabilities"]["textDocumentSync"]["change"] == 2);
 }
 
 DEFINE_TEST(test_local_handler_returns_shutdown_response) {
@@ -684,6 +692,117 @@ DEFINE_TEST(test_local_handler_swallows_dltxt_version_notification_without_id) {
     assert(!handling.forward_to_remote);
     assert(!handling.response.has_value());
     assert(handling.directive == bridge_local::SessionDirective::none);
+}
+
+DEFINE_TEST(test_text_document_loader_reads_utf8_bom_file) {
+    const std::filesystem::path file_path = std::filesystem::temp_directory_path() / "dltxt_bridge_utf8_bom_test.txt";
+    const std::string hello = utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF");
+    const std::string world = utf8_bytes("\xE4\xB8\x96\xE7\x95\x8C");
+    {
+        std::ofstream output(file_path, std::ios::binary);
+        const std::string bom_and_text = std::string{"\xEF\xBB\xBF", 3} + hello + "\r\n" + world;
+        output.write(bom_and_text.data(), static_cast<std::streamsize>(bom_and_text.size()));
+    }
+
+    const auto document = bridge_documents::TextDocumentLoader::load_from_file(file_path);
+
+    assert(document.getEncoding() == "UTF-8");
+    assert(document.getFilePath() == file_path);
+    assert(document.getFileName() == file_path.filename().string());
+    assert(bridge_documents::utf16_to_utf8(document.getLine(0)) == hello);
+    assert(bridge_documents::utf16_to_utf8(document.getLine(1)) == world);
+
+    std::filesystem::remove(file_path);
+}
+
+DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
+    auto manager = std::make_shared<bridge_documents::DocumentManager>();
+    bridge_local::RequestContext context{manager};
+    const std::string first_line = utf8_bytes("\xE7\xAC\xAC\xE4\xB8\x80\xE8\xA1\x8C");
+    const std::string second_line = utf8_bytes("\xE7\xAC\xAC\xE4\xBA\x8C\xE8\xA1\x8C");
+    const std::string updated_prefix = utf8_bytes("\xE6\x9B\xB4\xE6\x96\xB0\xE6\xB8\x88\xE3\x81\xBF");
+    const std::string updated_line = utf8_bytes("\xE6\x9B\xB4\xE6\x96\xB0\xE6\xB8\x88\xE3\x81\xBF\xE8\xA1\x8C");
+    const std::string saved_text = utf8_bytes("\xE4\xBF\x9D\xE5\xAD\x98\xE5\xBE\x8C");
+
+    const json open_request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didOpen"},
+        {"params", json{{"textDocument", json{{"uri", "file:///c:/tmp/doc.txt"}, {"version", 1}, {"text", first_line + "\n" + second_line}}}}}
+    };
+    const auto open_handling = bridge_local::handle_request(nullptr, open_request, &context);
+
+    assert(open_handling.forward_to_remote);
+    assert(manager->has_document("file:///c:/tmp/doc.txt"));
+    const auto* document_after_open = manager->find_document("file:///c:/tmp/doc.txt");
+    assert(document_after_open != nullptr);
+    assert(bridge_documents::utf16_to_utf8(document_after_open->getLine(0)) == first_line);
+    assert(bridge_documents::utf16_to_utf8(document_after_open->getLine(1)) == second_line);
+
+    const json change_request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didChange"},
+        {"params", json{
+            {"textDocument", json{{"uri", "file:///c:/tmp/doc.txt"}, {"version", 2}}},
+            {"contentChanges", json::array({json{{"range", json{{"start", json{{"line", 1}, {"character", 0}}}, {"end", json{{"line", 1}, {"character", 3}}}}}, {"text", updated_prefix}}})}
+        }}
+    };
+    const auto change_handling = bridge_local::handle_request(nullptr, change_request, &context);
+
+    assert(change_handling.forward_to_remote);
+    const auto* document_after_change = manager->find_document("file:///c:/tmp/doc.txt");
+    assert(document_after_change != nullptr);
+    assert(document_after_change->getVersion() == 2);
+    assert(bridge_documents::utf16_to_utf8(document_after_change->getLine(1)) == updated_line);
+
+    const json save_request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didSave"},
+        {"params", json{{"textDocument", json{{"uri", "file:///c:/tmp/doc.txt"}}}, {"text", saved_text}}}
+    };
+    const auto save_handling = bridge_local::handle_request(nullptr, save_request, &context);
+
+    assert(save_handling.forward_to_remote);
+    const auto* document_after_save = manager->find_document("file:///c:/tmp/doc.txt");
+    assert(document_after_save != nullptr);
+    assert(bridge_documents::utf16_to_utf8(document_after_save->getLine(0)) == saved_text);
+
+    const json close_request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didClose"},
+        {"params", json{{"textDocument", json{{"uri", "file:///c:/tmp/doc.txt"}}}}}
+    };
+    const auto close_handling = bridge_local::handle_request(nullptr, close_request, &context);
+
+    assert(close_handling.forward_to_remote);
+    assert(!manager->has_document("file:///c:/tmp/doc.txt"));
+}
+
+DEFINE_TEST(test_local_initialize_and_active_editor_update_document_manager) {
+    auto manager = std::make_shared<bridge_documents::DocumentManager>();
+    bridge_local::RequestContext context{manager};
+
+    const json initialize_request = json{
+        {"jsonrpc", "2.0"},
+        {"id", 1},
+        {"method", "initialize"},
+        {"params", json{{"workspaceFolders", json::array({json{{"uri", "file:///c:/repo"}, {"name", "repo"}}})}}}
+    };
+    const auto initialize_handling = bridge_local::handle_request(nullptr, initialize_request, &context);
+
+    assert(!initialize_handling.forward_to_remote);
+    assert(manager->workspace_folders().size() == 1);
+    assert(manager->workspace_folders()[0] == "file:///c:/repo");
+
+    const json active_editor_notification = json{
+        {"jsonrpc", "2.0"},
+        {"method", "dltxt/didChangeActiveTextEditor"},
+        {"params", json{{"textDocument", json{{"uri", "file:///c:/repo/doc.txt"}}}}}
+    };
+    const auto active_editor_handling = bridge_local::handle_request(nullptr, active_editor_notification, &context);
+
+    assert(!active_editor_handling.forward_to_remote);
+    assert(manager->active_document_uri().has_value());
+    assert(*manager->active_document_uri() == "file:///c:/repo/doc.txt");
 }
 
 DEFINE_TEST(test_response_manager_round_trip) {

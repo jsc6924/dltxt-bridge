@@ -19,6 +19,7 @@
 
 #include <nlohmann/json.hpp>
 #include "local_session.hpp"
+#include "bridge_documents.hpp"
 #include "bridge_version.hpp"
 
 namespace net = boost::asio;
@@ -408,6 +409,10 @@ enum class SessionDirective {
     close_session,
 };
 
+struct RequestContext {
+    std::shared_ptr<bridge_documents::DocumentManager> document_manager;
+};
+
 struct RequestResult {
     bool forward_to_remote = false;
     std::optional<json> response;
@@ -449,37 +454,213 @@ struct SubscribeParam {
     }
 };
 
-inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const json& request) {
+inline std::vector<std::string> workspace_folders_from_initialize_params(const json& params) {
+    std::vector<std::string> folders;
+
+    if (params.contains("workspaceFolders") && params["workspaceFolders"].is_array()) {
+        for (const auto& item : params["workspaceFolders"]) {
+            if (item.is_object() && item.contains("uri") && item["uri"].is_string()) {
+                folders.push_back(item["uri"].get<std::string>());
+            }
+        }
+    }
+
+    if (folders.empty() && params.contains("rootUri") && params["rootUri"].is_string()) {
+        folders.push_back(params["rootUri"].get<std::string>());
+    }
+
+    if (folders.empty() && params.contains("rootPath") && params["rootPath"].is_string()) {
+        folders.push_back(bridge_documents::file_uri_from_path(params["rootPath"].get<std::string>()));
+    }
+
+    return folders;
+}
+
+inline std::optional<bridge_documents::Range> range_from_json(const json& value) {
+    if (!value.is_object()) {
+        return std::nullopt;
+    }
+
+    const auto parse_position = [](const json& position) -> std::optional<bridge_documents::Position> {
+        if (!position.is_object() || !position.contains("line") || !position.contains("character")) {
+            return std::nullopt;
+        }
+        if (!position["line"].is_number_unsigned() || !position["character"].is_number_unsigned()) {
+            return std::nullopt;
+        }
+
+        return bridge_documents::Position{
+            position["line"].get<std::size_t>(),
+            position["character"].get<std::size_t>()
+        };
+    };
+
+    const auto start = parse_position(value.value("start", json::object()));
+    const auto end = parse_position(value.value("end", json::object()));
+    if (!start.has_value() || !end.has_value()) {
+        return std::nullopt;
+    }
+
+    return bridge_documents::Range{*start, *end};
+}
+
+inline std::vector<bridge_documents::TextChange> text_changes_from_json(const json& params) {
+    std::vector<bridge_documents::TextChange> changes;
+    if (!params.is_object() || !params.contains("contentChanges") || !params["contentChanges"].is_array()) {
+        return changes;
+    }
+
+    for (const auto& item : params["contentChanges"]) {
+        if (!item.is_object() || !item.contains("text") || !item["text"].is_string()) {
+            continue;
+        }
+
+        changes.push_back(bridge_documents::TextChange{
+            range_from_json(item.value("range", json())),
+            bridge_documents::utf8_to_utf16(item["text"].get<std::string>())
+        });
+    }
+
+    return changes;
+}
+
+inline std::string text_document_uri_from_params(const json& params) {
+    if (params.contains("textDocument") && params["textDocument"].is_object()) {
+        const auto& text_document = params["textDocument"];
+        if (text_document.contains("uri") && text_document["uri"].is_string()) {
+            return text_document["uri"].get<std::string>();
+        }
+    }
+
+    if (params.contains("uri") && params["uri"].is_string()) {
+        return params["uri"].get<std::string>();
+    }
+
+    return "";
+}
+
+inline json local_capabilities() {
+    return json{
+        {"capabilities", json{
+            {"textDocumentSync", json{
+                {"openClose", true},
+                {"change", 2},
+                {"save", json{{"includeText", true}}}
+            }},
+            {"workspace", json{{"workspaceFolders", json{{"supported", true}, {"changeNotifications", true}}}}}
+        }}
+    };
+}
+
+inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const json& request, RequestContext* context = nullptr) {
     if (!request.is_object() || !request.contains("method") || !request["method"].is_string()) {
         return RequestResult::error_response(request.value("id", nullptr), -32600, "Invalid Request: missing or invalid 'method' field");
     }
 
     const std::string method = request["method"].get<std::string>();
+    const json params = request.value("params", json::object());
     if (method.rfind("simpletm/", 0) == 0) {
         if (method == "simpletm/subscribeProject") {
-            const auto params = SubscribeParam::from_json(request.value("params", json::object()));
-            if (!params.has_value()) {
+            const auto subscribe_params = SubscribeParam::from_json(params);
+            if (!subscribe_params.has_value()) {
                 return RequestResult::error_response(request.value("id", nullptr), -32602, "Invalid params");
             }
 
-            session->register_subscription(params->project_id);
-            lsp::log_local_request(method, request.value("params", json::object()));
+            session->register_subscription(subscribe_params->project_id);
+            lsp::log_local_request(method, params);
         }
         return RequestResult::forward();
     }
 
+    if (method == "textDocument/didOpen") {
+        if (context != nullptr && context->document_manager) {
+            const json text_document = params.value("textDocument", json::object());
+            if (text_document.contains("uri") && text_document.contains("text")
+                && text_document["uri"].is_string() && text_document["text"].is_string()) {
+                context->document_manager->open_from_lsp(
+                    text_document["uri"].get<std::string>(),
+                    text_document["text"].get<std::string>(),
+                    text_document.value("version", 0));
+            }
+        }
+        lsp::log_local_notification(method, params);
+        return RequestResult::forward();
+    }
+
+    if (method == "textDocument/didChange") {
+        if (context != nullptr && context->document_manager) {
+            const std::string uri = text_document_uri_from_params(params);
+            context->document_manager->apply_lsp_changes(
+                uri,
+                params.value("textDocument", json::object()).value("version", 0),
+                text_changes_from_json(params));
+        }
+        lsp::log_local_notification(method, params);
+        return RequestResult::forward();
+    }
+
+    if (method == "textDocument/didSave") {
+        if (context != nullptr && context->document_manager) {
+            const std::string uri = text_document_uri_from_params(params);
+            if (params.contains("text") && params["text"].is_string()) {
+                context->document_manager->update_saved_document_text(uri, params["text"].get<std::string>());
+            }
+        }
+        lsp::log_local_notification(method, params);
+        return RequestResult::forward();
+    }
+
+    if (method == "textDocument/didClose") {
+        if (context != nullptr && context->document_manager) {
+            context->document_manager->close_document(text_document_uri_from_params(params));
+        }
+        lsp::log_local_notification(method, params);
+        return RequestResult::forward();
+    }
+
+    if (method == "workspace/didChangeWorkspaceFolders") {
+        if (context != nullptr && context->document_manager && params.contains("event") && params["event"].is_object()) {
+            const json event = params["event"];
+            if (event.contains("added") && event["added"].is_array()) {
+                for (const auto& item : event["added"]) {
+                    if (item.is_object() && item.contains("uri") && item["uri"].is_string()) {
+                        context->document_manager->add_workspace_folder(item["uri"].get<std::string>());
+                    }
+                }
+            }
+
+            if (event.contains("removed") && event["removed"].is_array()) {
+                for (const auto& item : event["removed"]) {
+                    if (item.is_object() && item.contains("uri") && item["uri"].is_string()) {
+                        context->document_manager->remove_workspace_folder(item["uri"].get<std::string>());
+                    }
+                }
+            }
+        }
+        lsp::log_local_notification(method, params);
+        return RequestResult::forward();
+    }
+
+    if (method == "workspace/didChangeActiveTextEditor" || method == "dltxt/didChangeActiveTextEditor") {
+        if (context != nullptr && context->document_manager) {
+            context->document_manager->set_active_document(text_document_uri_from_params(params));
+        }
+        lsp::log_local_notification(method, params);
+        return {};
+    }
+
     if (method == "initialized") {
-        lsp::log_local_request(method, request.value("params", json::object()));
+        lsp::log_local_request(method, params);
         return {};
     }
 
     if (method == "$/setTrace") {
-        lsp::log_local_request(method, request.value("params", json::object()));
+        lsp::log_local_request(method, params);
         return {};
     }
 
     if (method == "exit") {
-        lsp::log_local_request(method, request.value("params", json::object()));
+        lsp::log_local_request(method, params);
         return RequestResult{false, std::nullopt, SessionDirective::close_session};
     }
 
@@ -488,7 +669,6 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
             return {};
         }
 
-        const json params = request.value("params", json::object());
         const std::string message = params.value("message", "");
         fprintf(stderr, "Echoing message from client: %s\n", message.c_str());
 
@@ -513,9 +693,12 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
     }
 
     if (method == "initialize") {
+        if (context != nullptr && context->document_manager) {
+            context->document_manager->set_workspace_folders(workspace_folders_from_initialize_params(params));
+        }
         fprintf(stderr, "Handled initialize request %s locally\n", request["id"].dump().c_str());
         return RequestResult::local_response(
-            jsonrpc::create_response(request["id"], json{{"capabilities", json::object()}})
+            jsonrpc::create_response(request["id"], local_capabilities())
         );
     }
 

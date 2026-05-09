@@ -4,6 +4,7 @@
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/ssl.hpp>
 #include "bridge_app.hpp"
+#include "bridge_documents.hpp"
 #include "bridge_http_proxy.hpp"
 #include "bridge_protocol.hpp"
 #include "bridge_runtime.hpp"
@@ -259,6 +260,7 @@ net::awaitable<void> handle_local_session(
     std::shared_ptr<RemoteRegistry> remote_registry,
     std::shared_ptr<LocalSessionManager> session_manager,
     std::shared_ptr<ResponseManager> response_manager,
+    std::shared_ptr<bridge_documents::DocumentManager> document_manager,
     std::chrono::milliseconds request_timeout) {
     fprintf(stderr, "Accepted local stdio session\n");
     
@@ -310,7 +312,8 @@ net::awaitable<void> handle_local_session(
             
             fprintf(stderr, "JSON-RPC Request: %s\n", request.dump().c_str());
 
-            auto local_handling = bridge_local::handle_request(session, request);
+            bridge_local::RequestContext request_context{document_manager};
+            auto local_handling = bridge_local::handle_request(session, request, &request_context);
             if (!local_handling.forward_to_remote) {
                 if (local_handling.response.has_value()) {
                     co_await write_json_message(session, *local_handling.response);
@@ -439,6 +442,7 @@ int main(int argc, char* argv[]) {
         auto remote_registry = std::make_shared<RemoteRegistry>();
         auto session_manager = std::make_shared<LocalSessionManager>();
         auto response_manager = std::make_shared<ResponseManager>();
+        auto document_manager = std::make_shared<bridge_documents::DocumentManager>();
         auto http_proxy_service = std::make_shared<bridge_http::MojiProxyService>(ioc.get_executor(), dltxt_bridge::version);
         auto local_input = open_stdio_input_handle();
         auto local_input_queue = std::make_shared<LocalInputQueue>(ioc.get_executor());
@@ -446,9 +450,9 @@ int main(int argc, char* argv[]) {
         start_stdio_reader_thread(ioc.get_executor(), local_input, local_input_queue);
 
         // Launch ONE coordinator coroutine to handle startup order
-        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, local_input_queue, local_session, settings]() mutable -> net::awaitable<void> {
+        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, document_manager, local_input_queue, local_session, settings]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
-            net::co_spawn(ex, handle_local_session(local_input_queue, local_session, remote_registry, session_manager, response_manager, settings.request_timeout), net::detached);
+            net::co_spawn(ex, handle_local_session(local_input_queue, local_session, remote_registry, session_manager, response_manager, document_manager, settings.request_timeout), net::detached);
 
             co_await run_remote_retry_loop(
                 remote_registry,
