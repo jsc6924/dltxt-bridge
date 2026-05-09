@@ -16,8 +16,11 @@
 #include "../bridge_app.hpp"
 #include "../bridge_documents.hpp"
 #include "../bridge_http_proxy.hpp"
+#include "../bridge_local_requests.hpp"
 #include "../bridge_protocol.hpp"
 #include "../bridge_runtime.hpp"
+#include "../bridge_similarity_index.hpp"
+#include "../bridge_text_parser.hpp"
 
 namespace {
 using TestFn = void (*)();
@@ -614,6 +617,7 @@ DEFINE_TEST(test_local_initialize_request_returns_empty_capabilities) {
     assert((*handling.response)["result"].is_object());
     assert((*handling.response)["result"]["capabilities"]["textDocumentSync"]["openClose"] == true);
     assert((*handling.response)["result"]["capabilities"]["textDocumentSync"]["change"] == 2);
+    assert((*handling.response)["result"]["capabilities"]["textDocumentSync"]["save"]["includeText"] == false);
 }
 
 DEFINE_TEST(test_local_handler_returns_shutdown_response) {
@@ -715,6 +719,11 @@ DEFINE_TEST(test_text_document_loader_reads_utf8_bom_file) {
     std::filesystem::remove(file_path);
 }
 
+DEFINE_TEST(test_utf_conversions_accept_empty_strings) {
+    assert(bridge_documents::utf8_to_utf16("").empty());
+    assert(bridge_documents::utf16_to_utf8(std::u16string{}).empty());
+}
+
 DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
     auto manager = std::make_shared<bridge_documents::DocumentManager>();
     bridge_local::RequestContext context{manager};
@@ -731,7 +740,7 @@ DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
     };
     const auto open_handling = bridge_local::handle_request(nullptr, open_request, &context);
 
-    assert(open_handling.forward_to_remote);
+    assert(!open_handling.forward_to_remote);
     assert(manager->has_document("file:///c:/tmp/doc.txt"));
     const auto* document_after_open = manager->find_document("file:///c:/tmp/doc.txt");
     assert(document_after_open != nullptr);
@@ -748,7 +757,7 @@ DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
     };
     const auto change_handling = bridge_local::handle_request(nullptr, change_request, &context);
 
-    assert(change_handling.forward_to_remote);
+    assert(!change_handling.forward_to_remote);
     const auto* document_after_change = manager->find_document("file:///c:/tmp/doc.txt");
     assert(document_after_change != nullptr);
     assert(document_after_change->getVersion() == 2);
@@ -761,7 +770,7 @@ DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
     };
     const auto save_handling = bridge_local::handle_request(nullptr, save_request, &context);
 
-    assert(save_handling.forward_to_remote);
+    assert(!save_handling.forward_to_remote);
     const auto* document_after_save = manager->find_document("file:///c:/tmp/doc.txt");
     assert(document_after_save != nullptr);
     assert(bridge_documents::utf16_to_utf8(document_after_save->getLine(0)) == saved_text);
@@ -773,11 +782,128 @@ DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
     };
     const auto close_handling = bridge_local::handle_request(nullptr, close_request, &context);
 
-    assert(close_handling.forward_to_remote);
+    assert(!close_handling.forward_to_remote);
     assert(!manager->has_document("file:///c:/tmp/doc.txt"));
 }
 
-DEFINE_TEST(test_local_initialize_and_active_editor_update_document_manager) {
+DEFINE_TEST(test_local_handler_accepts_empty_text_change_notification) {
+    auto manager = std::make_shared<bridge_documents::DocumentManager>();
+    bridge_local::RequestContext context{manager};
+
+    const json open_request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didOpen"},
+        {"params", json{{"textDocument", json{{"uri", "file:///c:/tmp/doc.txt"}, {"version", 1}, {"text", "alpha\nbeta"}}}}}
+    };
+    const auto open_handling = bridge_local::handle_request(nullptr, open_request, &context);
+
+    assert(!open_handling.forward_to_remote);
+
+    const json change_request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didChange"},
+        {"params", json{
+            {"textDocument", json{{"uri", "file:///c:/tmp/doc.txt"}, {"version", 2}}},
+            {"contentChanges", json::array({json{{"range", json{{"start", json{{"line", 1}, {"character", 1}}}, {"end", json{{"line", 1}, {"character", 4}}}}}, {"text", ""}}})}
+        }}
+    };
+    const auto change_handling = bridge_local::handle_request(nullptr, change_request, &context);
+
+    assert(!change_handling.forward_to_remote);
+    const auto* document_after_change = manager->find_document("file:///c:/tmp/doc.txt");
+    assert(document_after_change != nullptr);
+    assert(document_after_change->getVersion() == 2);
+    assert(bridge_documents::utf16_to_utf8(document_after_change->getLine(0)) == "alpha");
+    assert(bridge_documents::utf16_to_utf8(document_after_change->getLine(1)) == "b");
+}
+
+DEFINE_TEST(test_update_saved_document_text_debounces_full_syncs_within_one_minute) {
+    bridge_documents::DocumentManager manager;
+    manager.open_from_lsp("file:///c:/tmp/doc.txt", "start", 1);
+
+    const auto base_time = std::chrono::steady_clock::time_point{};
+
+    const bool first_applied = manager.update_saved_document_text(
+        "file:///c:/tmp/doc.txt",
+        "first",
+        base_time);
+    assert(first_applied);
+
+    const auto* after_first_save = manager.find_document("file:///c:/tmp/doc.txt");
+    assert(after_first_save != nullptr);
+    assert(bridge_documents::utf16_to_utf8(after_first_save->getContent()) == "first");
+
+    const bool second_applied = manager.update_saved_document_text(
+        "file:///c:/tmp/doc.txt",
+        "second",
+        base_time + std::chrono::seconds(30));
+    assert(!second_applied);
+
+    const auto* after_second_save = manager.find_document("file:///c:/tmp/doc.txt");
+    assert(after_second_save != nullptr);
+    assert(bridge_documents::utf16_to_utf8(after_second_save->getContent()) == "first");
+
+    const bool third_applied = manager.update_saved_document_text(
+        "file:///c:/tmp/doc.txt",
+        "third",
+        base_time + std::chrono::seconds(61));
+    assert(third_applied);
+
+    const auto* after_third_save = manager.find_document("file:///c:/tmp/doc.txt");
+    assert(after_third_save != nullptr);
+    assert(bridge_documents::utf16_to_utf8(after_third_save->getContent()) == "third");
+}
+
+DEFINE_TEST(test_local_handler_reads_saved_document_from_disk_when_text_is_omitted) {
+    const auto file_path = std::filesystem::temp_directory_path() / "dltxt_bridge_didsave_disk_reload.txt";
+    {
+        std::ofstream output(file_path, std::ios::binary);
+        output << "saved from disk";
+    }
+
+    auto manager = std::make_shared<bridge_documents::DocumentManager>();
+    bridge_local::RequestContext context{manager};
+    const std::string uri = bridge_documents::file_uri_from_path(file_path.string());
+
+    manager->open_from_lsp(uri, "stale in memory", 3);
+
+    const json save_request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didSave"},
+        {"params", json{{"textDocument", json{{"uri", uri}}}}}
+    };
+
+    const auto save_handling = bridge_local::handle_request(nullptr, save_request, &context);
+
+    assert(!save_handling.forward_to_remote);
+    const auto* document_after_save = manager->find_document(uri);
+    assert(document_after_save != nullptr);
+    assert(bridge_documents::utf16_to_utf8(document_after_save->getContent()) == "saved from disk");
+
+    std::filesystem::remove(file_path);
+}
+
+DEFINE_TEST(test_workspace_folder_change_stays_local) {
+    auto manager = std::make_shared<bridge_documents::DocumentManager>();
+    bridge_local::RequestContext context{manager};
+
+    const json request = json{
+        {"jsonrpc", "2.0"},
+        {"method", "workspace/didChangeWorkspaceFolders"},
+        {"params", json{{"event", json{
+            {"added", json::array({json{{"uri", "file:///c:/repo-added"}, {"name", "repo-added"}}})},
+            {"removed", json::array()}
+        }}}}
+    };
+
+    const auto handling = bridge_local::handle_request(nullptr, request, &context);
+
+    assert(!handling.forward_to_remote);
+    assert(manager->workspace_folders().size() == 1);
+    assert(manager->workspace_folders()[0] == "file:///c:/repo-added");
+}
+
+DEFINE_TEST(test_local_initialize_updates_document_manager_workspace_folders) {
     auto manager = std::make_shared<bridge_documents::DocumentManager>();
     bridge_local::RequestContext context{manager};
 
@@ -792,17 +918,6 @@ DEFINE_TEST(test_local_initialize_and_active_editor_update_document_manager) {
     assert(!initialize_handling.forward_to_remote);
     assert(manager->workspace_folders().size() == 1);
     assert(manager->workspace_folders()[0] == "file:///c:/repo");
-
-    const json active_editor_notification = json{
-        {"jsonrpc", "2.0"},
-        {"method", "dltxt/didChangeActiveTextEditor"},
-        {"params", json{{"textDocument", json{{"uri", "file:///c:/repo/doc.txt"}}}}}
-    };
-    const auto active_editor_handling = bridge_local::handle_request(nullptr, active_editor_notification, &context);
-
-    assert(!active_editor_handling.forward_to_remote);
-    assert(manager->active_document_uri().has_value());
-    assert(*manager->active_document_uri() == "file:///c:/repo/doc.txt");
 }
 
 DEFINE_TEST(test_local_handler_returns_opened_documents_contents) {
@@ -823,6 +938,217 @@ DEFINE_TEST(test_local_handler_returns_opened_documents_contents) {
     assert((*handling.response)["result"].size() == 2);
     assert((*handling.response)["result"]["file:///c:/repo/a.txt"] == "first\ndocument");
     assert((*handling.response)["result"]["file:///c:/repo/b.txt"] == "second document");
+}
+
+DEFINE_TEST(test_similarity_index_returns_best_match_with_metadata) {
+    bridge_similarity::SimilarityIndex index;
+    index.upsert(1, "c:/repo/a.txt", 2, u"alphaalpha");
+    index.upsert(2, "c:/repo/b.txt", 7, u"alphabeta");
+    index.upsert(3, "c:/repo/c.txt", 9, u"zzzzzzzz");
+
+    const auto results = index.search(u"alphaalpha", 0.0, 2);
+
+    assert(results.size() == 2);
+    assert(results[0].line_id == 1);
+    assert(results[0].file_path == "c:/repo/a.txt");
+    assert(results[0].line_number == 2);
+    assert(results[0].score > results[1].score);
+    assert(results[1].line_id == 2);
+}
+
+DEFINE_TEST(test_similarity_index_upsert_replaces_existing_line_content) {
+    bridge_similarity::SimilarityIndex index;
+    index.upsert(1, "c:/repo/a.txt", 1, u"abcdef");
+    index.upsert(2, "c:/repo/b.txt", 2, u"xyzxyz");
+
+    auto before_update = index.search(u"abcdef", 0.0, 2);
+    assert(!before_update.empty());
+    assert(before_update[0].line_id == 1);
+
+    index.upsert(1, "c:/repo/a.txt", 1, u"mnopqr");
+
+    const auto old_query_results = index.search(u"abcdef", 0.0, 2);
+    assert(old_query_results.empty());
+
+    const auto new_query_results = index.search(u"mnopqr", 0.0, 2);
+    assert(new_query_results.size() == 1);
+    assert(new_query_results[0].line_id == 1);
+}
+
+DEFINE_TEST(test_similarity_index_erase_removes_line_from_search_results) {
+    bridge_similarity::SimilarityIndex index;
+    index.upsert(10, "c:/repo/a.txt", 0, u"memoryline");
+    index.upsert(11, "c:/repo/b.txt", 1, u"engineline");
+
+    assert(index.erase(10));
+    assert(!index.erase(10));
+
+    const auto results = index.search(u"memoryline", 0.0, 5);
+    assert(results.empty());
+    assert(index.document_count() == 1);
+}
+
+DEFINE_TEST(test_similarity_index_counts_distinct_files_by_internal_id) {
+    bridge_similarity::SimilarityIndex index;
+    index.upsert(1, "c:/repo/shared.txt", 0, u"abcdef");
+    index.upsert(2, "c:/repo/shared.txt", 1, u"bcdefg");
+    index.upsert(3, "c:/repo/other.txt", 2, u"cdefgh");
+
+    assert(index.document_count() == 3);
+    assert(index.file_count() == 2);
+
+    assert(index.erase(1));
+    assert(index.file_count() == 2);
+    assert(index.erase(2));
+    assert(index.file_count() == 1);
+}
+
+DEFINE_TEST(test_similarity_index_honors_threshold_and_max_results) {
+    bridge_similarity::SimilarityIndex index;
+    index.upsert(1, "c:/repo/a.txt", 0, u"abcdefgh");
+    index.upsert(2, "c:/repo/b.txt", 1, u"abcdefzz");
+    index.upsert(3, "c:/repo/c.txt", 2, u"abcxxxxx");
+
+    const auto limited_results = index.search(u"abcdefgh", 0.3, 2);
+
+    assert(limited_results.size() == 2);
+    assert(limited_results[0].line_id == 1);
+    assert(limited_results[1].line_id == 2);
+    assert(limited_results[0].score >= limited_results[1].score);
+
+    const auto filtered_results = index.search(u"abcdefgh", 0.9, 5);
+    assert(filtered_results.size() == 1);
+    assert(filtered_results[0].line_id == 1);
+}
+
+DEFINE_TEST(test_similarity_index_handles_japanese_utf16_escape_literals) {
+    bridge_similarity::SimilarityIndex index;
+
+    const std::u16string exact = u"\u4ECA\u65E5\u306F\u3044\u3044\u5929\u6C17\u3067\u3059";
+    const std::u16string similar = u"\u4ECA\u65E5\u306F\u826F\u3044\u5929\u6C17\u3067\u3059\u306D";
+    const std::u16string different = u"\u6628\u65E5\u306F\u96E8\u3067\u3057\u305F";
+
+    index.upsert(21, "c:/repo/weather-a.txt", 4, exact);
+    index.upsert(22, "c:/repo/weather-b.txt", 8, similar);
+    index.upsert(23, "c:/repo/weather-c.txt", 9, different);
+
+    const auto results = index.search(exact, 0.0, 3);
+
+    assert(results.size() == 3);
+    assert(results[0].line_id == 21);
+    assert(results[0].file_path == "c:/repo/weather-a.txt");
+    assert(results[0].line_number == 4);
+    assert(results[1].line_id == 22);
+    assert(results[0].score > results[1].score);
+    assert(results[1].score > results[2].score);
+    assert(results[2].line_id == 23);
+}
+
+DEFINE_TEST(test_similarity_index_replaces_japanese_utf16_escape_content) {
+    bridge_similarity::SimilarityIndex index;
+
+    const std::u16string old_line = u"\u3053\u3093\u306B\u3061\u306F\u4E16\u754C";
+    const std::u16string new_line = u"\u3053\u3093\u3070\u3093\u306F\u4E16\u754C";
+
+    index.upsert(31, "c:/repo/greeting.txt", 1, old_line);
+
+    const auto old_results = index.search(old_line, 0.0, 2);
+    assert(old_results.size() == 1);
+    assert(old_results[0].line_id == 31);
+
+    index.upsert(31, "c:/repo/greeting.txt", 1, new_line);
+
+    const auto stale_results = index.search(old_line, 0.8, 2);
+    assert(stale_results.empty());
+
+    const auto refreshed_results = index.search(new_line, 0.0, 2);
+    assert(refreshed_results.size() == 1);
+    assert(refreshed_results[0].line_id == 31);
+}
+
+DEFINE_TEST(test_standard_text_parser_extracts_japanese_pairs) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+    const bridge_text::StandardTextParser parser(config);
+
+    const std::u16string text =
+        u"\u25CB00027145T\u25CB\u3053\u3093\u306B\u3061\u306F\u3002\n"
+        u"\u25CF00027145T\u25CF\u4F60\u597D\u3002\n\n"
+        u"\u25CB00027148N\u25CB\u83EF\u6DE1\n"
+        u"\u25CF00027148N\u25CF\u83EF\u6DE1\n";
+
+    const auto pairs = parser.parse_paired_lines(text);
+
+    assert(pairs.size() == 2);
+    assert(pairs[0].original_line_index == 0);
+    assert(pairs[0].translated_line_index == 1);
+    assert(pairs[0].original.text == u"\u3053\u3093\u306B\u3061\u306F\u3002");
+    assert(pairs[0].translated.text == u"\u4F60\u597D\u3002");
+    assert(pairs[1].original_line_index == 3);
+    assert(pairs[1].translated_line_index == 4);
+    assert(pairs[1].original.text == u"\u83EF\u6DE1");
+}
+
+DEFINE_TEST(test_standard_text_parser_adjusts_quote_boundaries_for_japanese_lines) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+    const bridge_text::StandardTextParser parser(config);
+
+    const std::u16string text =
+        u"\u25CB00027147T\u25CB\u300E\u305D\u3046\u304B\u300F\n"
+        u"\u25CF00027147T\u25CF\u201C\u662F\u5417\u201D\n";
+
+    const auto pairs = parser.parse_paired_lines(text);
+
+    assert(pairs.size() == 1);
+    assert(pairs[0].original.white == u"\u300E");
+    assert(pairs[0].original.text == u"\u305D\u3046\u304B");
+    assert(pairs[0].original.suffix == u"\u300F");
+    assert(pairs[0].translated.white == u"\u201C");
+    assert(pairs[0].translated.text == u"\u662F\u5417");
+    assert(pairs[0].translated.suffix == u"\u201D");
+}
+
+DEFINE_TEST(test_standard_text_parser_throws_on_dangling_original_line) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+    const bridge_text::StandardTextParser parser(config);
+
+    bool threw = false;
+    try {
+        (void)parser.parse_paired_lines(u"\u25CB00027145T\u25CB\u3053\u3093\u306B\u3061\u306F\u3002\n");
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+
+    assert(threw);
 }
 
 DEFINE_TEST(test_text_document_edit_splits_single_line_when_patch_contains_newline) {
@@ -921,6 +1247,61 @@ DEFINE_TEST(test_text_document_edit_expands_multi_line_range_with_multi_line_pat
     assert(bridge_documents::utf16_to_utf8(document.getLine(1)) == "Y");
     assert(bridge_documents::utf16_to_utf8(document.getLine(2)) == "Zi");
     assert(bridge_documents::utf16_to_utf8(document.getLine(3)) == "jkl");
+}
+
+DEFINE_TEST(test_text_document_edit_rejects_out_of_bounds_range) {
+    bridge_documents::TextDocument document(
+        "file:///c:/repo/doc.txt",
+        "client-decoded",
+        "c:/repo/doc.txt",
+        1,
+        bridge_documents::utf8_to_utf16("short\ntext"));
+
+    bool threw = false;
+    try {
+        document.edit(
+            bridge_documents::TextChange{
+                bridge_documents::Range{
+                    bridge_documents::Position{0, 99},
+                    bridge_documents::Position{0, 99}
+                },
+                bridge_documents::utf8_to_utf16("")
+            },
+            2);
+    } catch (const std::out_of_range&) {
+        threw = true;
+    }
+
+    assert(threw);
+    assert(document.getVersion() == 1);
+    assert(document.getLines().size() == 2);
+    assert(bridge_documents::utf16_to_utf8(document.getLine(0)) == "short");
+    assert(bridge_documents::utf16_to_utf8(document.getLine(1)) == "text");
+}
+
+DEFINE_TEST(test_apply_lsp_changes_ignores_invalid_range_without_throwing) {
+    bridge_documents::DocumentManager manager;
+    manager.open_from_lsp("file:///c:/repo/doc.txt", "short\ntext", 1);
+
+    manager.apply_lsp_changes(
+        "file:///c:/repo/doc.txt",
+        2,
+        std::vector<bridge_documents::TextChange>{
+            bridge_documents::TextChange{
+                bridge_documents::Range{
+                    bridge_documents::Position{0, 99},
+                    bridge_documents::Position{0, 99}
+                },
+                bridge_documents::utf8_to_utf16("")
+            }
+        });
+
+    const auto* document = manager.find_document("file:///c:/repo/doc.txt");
+    assert(document != nullptr);
+    assert(document->getVersion() == 1);
+    assert(document->getLines().size() == 2);
+    assert(bridge_documents::utf16_to_utf8(document->getLine(0)) == "short");
+    assert(bridge_documents::utf16_to_utf8(document->getLine(1)) == "text");
 }
 
 DEFINE_TEST(test_response_manager_round_trip) {
@@ -1088,6 +1469,134 @@ DEFINE_TEST(test_response_manager_times_out_waiters) {
     assert(result.has_value());
     assert(result->status == ResponseManager::WaitStatus::timed_out);
     assert(!result->response.has_value());
+}
+
+DEFINE_TEST(test_try_store_jsonrpc_response_matches_pending_request) {
+    net::io_context ioc;
+    auto manager = std::make_shared<ResponseManager>();
+    const RequestId original_id = std::string{"req-local-response"};
+    const RequestId bridge_id = manager->create_bridge_request_id(original_id, ioc.get_executor());
+
+    std::optional<ResponseManager::WaitResult> result;
+
+    net::co_spawn(ioc,
+        [manager, &result, bridge_id]() -> net::awaitable<void> {
+            result = co_await manager->wait_for_response(bridge_id);
+            co_return;
+        },
+        net::detached);
+
+    const bool stored = bridge_local::try_store_jsonrpc_response(
+        json{{"jsonrpc", "2.0"}, {"id", jsonrpc::request_id_to_json(bridge_id)}, {"result", json{{"ok", true}}}},
+        manager);
+
+    ioc.run();
+
+    assert(stored);
+    assert(result.has_value());
+    assert(result->status == ResponseManager::WaitStatus::response_ready);
+    assert(result->response.has_value());
+    assert((*result->response)["id"] == "req-local-response");
+    assert((*result->response)["result"]["ok"] == true);
+}
+
+DEFINE_TEST(test_local_request_dispatcher_round_trips_over_local_session) {
+    using namespace std::chrono_literals;
+
+    net::io_context ioc;
+
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    tcp::socket client_socket(ioc);
+    client_socket.connect({net::ip::address_v4::loopback(), acceptor.local_endpoint().port()});
+
+    auto server_socket = std::make_shared<tcp::socket>(ioc);
+    acceptor.accept(*server_socket);
+    auto session = std::make_shared<LocalSession>(server_socket);
+    auto response_manager = std::make_shared<ResponseManager>();
+    auto dispatcher = std::make_shared<bridge_local::LocalRequestDispatcher>(session, response_manager, 100ms);
+
+    beast::flat_buffer read_buffer;
+    std::optional<json> outbound_request;
+    std::optional<json> response;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            response = co_await dispatcher->send_request("dltxt/get_parser_regex");
+            co_return;
+        },
+        net::detached);
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            auto payload = co_await lsp::read_message(client_socket, read_buffer);
+            assert(payload.has_value());
+            outbound_request = json::parse(*payload);
+            assert((*outbound_request)["method"] == "dltxt/get_parser_regex");
+            assert((*outbound_request)["params"].is_object());
+
+            const bool stored = bridge_local::try_store_jsonrpc_response(
+                json{
+                    {"jsonrpc", "2.0"},
+                    {"id", (*outbound_request)["id"]},
+                    {"result", json{
+                        {"originalPrefixRegex", "JP"},
+                        {"translatedPrefixRegex", "CN"},
+                        {"otherPrefixRegex", "OTHER"},
+                        {"originalWhiteRegex", ""},
+                        {"translatedWhiteRegex", ""},
+                        {"originalSuffixRegex", ""},
+                        {"translatedSuffixRegex", ""}
+                    }}
+                },
+                response_manager);
+            assert(stored);
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(outbound_request.has_value());
+    assert(response.has_value());
+    assert((*response)["result"]["originalPrefixRegex"] == "JP");
+    assert((*response)["result"]["translatedPrefixRegex"] == "CN");
+}
+
+DEFINE_TEST(test_standard_text_parser_builds_from_runtime_regex_request) {
+    net::io_context ioc;
+    std::optional<std::vector<bridge_text::ParsedPair>> pairs;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            auto parser = co_await bridge_text::StandardTextParser::create_from_request_sender(
+                [](const std::string& method, const bridge_text::json&) -> net::awaitable<bridge_text::json> {
+                    assert(method == "dltxt/get_parser_regex");
+                    co_return bridge_text::json{
+                        {"jsonrpc", "2.0"},
+                        {"id", "local-client-1"},
+                        {"result", bridge_text::json{
+                            {"originalPrefixRegex", "A"},
+                            {"translatedPrefixRegex", "B"},
+                            {"otherPrefixRegex", ""},
+                            {"originalWhiteRegex", ""},
+                            {"translatedWhiteRegex", ""},
+                            {"originalSuffixRegex", ""},
+                            {"translatedSuffixRegex", ""}
+                        }}
+                    };
+                });
+
+            pairs = parser.parse_paired_lines(u"A\u3053\u3093\u306B\u3061\u306F\nB\u4F60\u597D\n");
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(pairs.has_value());
+    assert(pairs->size() == 1);
+    assert((*pairs)[0].original.text == u"\u3053\u3093\u306B\u3061\u306F");
+    assert((*pairs)[0].translated.text == u"\u4F60\u597D");
 }
 
 struct FakeRemote {

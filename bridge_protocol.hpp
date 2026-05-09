@@ -393,6 +393,15 @@ inline json create_error(const json& id, int code, const std::string& message) {
     };
 }
 
+inline json create_request(const json& id, const std::string& method, const json& params = json::object()) {
+    return json{
+        {"jsonrpc", "2.0"},
+        {"id", id},
+        {"method", method},
+        {"params", params}
+    };
+}
+
 inline json create_notification(const std::string& method, const json& params = json::object()) {
     return json{
         {"jsonrpc", "2.0"},
@@ -545,7 +554,7 @@ inline json local_capabilities() {
             {"textDocumentSync", json{
                 {"openClose", true},
                 {"change", 2},
-                {"save", json{{"includeText", true}}}
+                {"save", json{{"includeText", false}}}
             }},
             {"workspace", json{{"workspaceFolders", json{{"supported", true}, {"changeNotifications", true}}}}}
         }}
@@ -584,7 +593,7 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
             }
         }
         lsp::log_local_notification(method, params);
-        return RequestResult::forward();
+        return {};
     }
 
     if (method == "textDocument/didChange") {
@@ -596,7 +605,7 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
                 text_changes_from_json(params));
         }
         lsp::log_local_notification(method, params);
-        return RequestResult::forward();
+        return {};
     }
 
     if (method == "textDocument/didSave") {
@@ -604,10 +613,12 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
             const std::string uri = text_document_uri_from_params(params);
             if (params.contains("text") && params["text"].is_string()) {
                 context->document_manager->update_saved_document_text(uri, params["text"].get<std::string>());
+            } else {
+                context->document_manager->update_saved_document_from_disk(uri);
             }
         }
         lsp::log_local_notification(method, params);
-        return RequestResult::forward();
+        return {};
     }
 
     if (method == "textDocument/didClose") {
@@ -615,7 +626,7 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
             context->document_manager->close_document(text_document_uri_from_params(params));
         }
         lsp::log_local_notification(method, params);
-        return RequestResult::forward();
+        return {};
     }
 
     if (method == "workspace/didChangeWorkspaceFolders") {
@@ -636,14 +647,6 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
                     }
                 }
             }
-        }
-        lsp::log_local_notification(method, params);
-        return RequestResult::forward();
-    }
-
-    if (method == "workspace/didChangeActiveTextEditor" || method == "dltxt/didChangeActiveTextEditor") {
-        if (context != nullptr && context->document_manager) {
-            context->document_manager->set_active_document(text_document_uri_from_params(params));
         }
         lsp::log_local_notification(method, params);
         return {};
@@ -685,6 +688,40 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
         fprintf(stderr, "Responding to version request from client\n");
         return RequestResult::local_response(
             jsonrpc::create_response(request["id"], json{{"version", dltxt_bridge::version}})
+        );
+    }
+
+    if (method == "dltxt/get_document_content") {
+        if (!request.contains("id")) {
+            return {};
+        }
+
+        if (!params.contains("uri") || !params["uri"].is_string()) {
+            return RequestResult::error_response(request["id"], -32602, "Invalid params: missing or invalid 'uri' field");
+        }
+
+        json contents = json::object();
+        if (context != nullptr && context->document_manager) {
+            const std::string uri = params["uri"].get<std::string>();
+            fprintf(stderr, "dltxt/get_document_content lookup uri=%s\n", uri.c_str());
+            const auto content_opt = context->document_manager->document_content_utf8_by_uri(uri);
+            if (content_opt.has_value()) {
+                fprintf(stderr,
+                    "dltxt/get_document_content hit uri=%s content_bytes=%zu\n",
+                    uri.c_str(),
+                    content_opt->size());
+                contents["content"] = *content_opt;
+            } else {
+                fprintf(stderr,
+                    "dltxt/get_document_content miss uri=%s open_document_count=%zu\n",
+                    uri.c_str(),
+                    context->document_manager->open_document_count());
+                return RequestResult::error_response(request["id"], -32602, "Document not found for URI: " + uri);
+            }
+        }
+
+        return RequestResult::local_response(
+            jsonrpc::create_response(request["id"], std::move(contents))
         );
     }
 
@@ -775,6 +812,13 @@ public:
         std::shared_ptr<Tracker> tracker = it != pending_responses_.end() ? it->second : nullptr;
 
         if (tracker) {
+            if (!tracker->responses.empty()) {
+                json response = std::move(tracker->responses.front());
+                tracker->responses.pop_front();
+                response["id"] = jsonrpc::request_id_to_json(tracker->original_id);
+                co_return WaitResult{WaitStatus::response_ready, std::move(response)};
+            }
+
             auto [error] = co_await tracker->signal->async_wait(net::as_tuple(net::use_awaitable));
 
             if (!tracker->responses.empty()) {
@@ -792,12 +836,15 @@ public:
         co_return WaitResult{WaitStatus::cancelled, std::nullopt};
     }
 
-    void store_response(const RequestId& id, const json& response) {
+    bool store_response(const RequestId& id, const json& response) {
         auto it = pending_responses_.find(id);
         if (it != pending_responses_.end()) {
             it->second->responses.push_back(response);
             it->second->signal->cancel();
+            return true;
         }
+
+        return false;
     }
 
     void cancel_all() {

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cctype>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -304,6 +306,10 @@ inline std::u16string utf16le_bytes_to_string(std::string_view bytes) {
 
 inline std::u16string convert_to_utf16(std::string_view input, const std::string& from_encoding) {
 #ifdef _WIN32
+    if (input.empty()) {
+        return {};
+    }
+
     auto normalized_encoding = from_encoding;
     std::transform(normalized_encoding.begin(), normalized_encoding.end(), normalized_encoding.begin(),
         [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
@@ -416,6 +422,10 @@ inline std::u16string utf8_to_utf16(std::string_view utf8_text) {
 
 inline std::string utf16_to_utf8(std::u16string_view utf16_text) {
 #ifdef _WIN32
+    if (utf16_text.empty()) {
+        return {};
+    }
+
     std::wstring wide_text(utf16_text.begin(), utf16_text.end());
     const int utf8_length = WideCharToMultiByte(
         CP_UTF8,
@@ -540,6 +550,23 @@ public:
         const auto startChar = change.range->start.character;
         const auto endLine = change.range->end.line;
         const auto endChar = change.range->end.character;
+
+        if (startLine > endLine) {
+            throw std::out_of_range("edit range start line is after end line");
+        }
+
+        if (startLine >= lines_.size() || endLine >= lines_.size()) {
+            throw std::out_of_range("edit range line out of bounds");
+        }
+
+        if (startChar > lines_[startLine].size() || endChar > lines_[endLine].size()) {
+            throw std::out_of_range("edit range character out of bounds");
+        }
+
+        if (startLine == endLine && startChar > endChar) {
+            throw std::out_of_range("edit range start character is after end character");
+        }
+
         auto patch = split_lines(change.text);
         if (startLine == endLine && patch.size() == 1) {
             auto& line = lines_[startLine];
@@ -605,10 +632,20 @@ public:
 
 class DocumentManager {
     std::unordered_map<std::string, TextDocument> open_documents_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_full_sync_at_;
     std::vector<std::string> workspace_folders_;
-    std::optional<std::string> active_document_uri_;
+
+    bool should_debounce_saved_document_sync(
+        const std::string& uri,
+        std::chrono::steady_clock::time_point sync_time) const {
+        const auto last_sync = last_full_sync_at_.find(uri);
+        return last_sync != last_full_sync_at_.end()
+            && sync_time - last_sync->second < saved_document_sync_debounce_window;
+    }
 
 public:
+    static inline constexpr auto saved_document_sync_debounce_window = std::chrono::minutes(1);
+
     void set_workspace_folders(std::vector<std::string> workspace_folders) {
         workspace_folders_ = std::move(workspace_folders);
     }
@@ -630,6 +667,7 @@ public:
     }
 
     void upsert_open_document(TextDocument document) {
+        last_full_sync_at_.erase(document.getUri());
         open_documents_[document.getUri()] = std::move(document);
     }
 
@@ -640,41 +678,84 @@ public:
     void apply_lsp_changes(const std::string& uri, int version, const std::vector<TextChange>& changes) {
         auto it = open_documents_.find(uri);
         if (it == open_documents_.end()) {
+            fprintf(stderr,
+                "DocumentManager::apply_lsp_changes skipped missing uri=%s version=%d change_count=%zu\n",
+                uri.c_str(),
+                version,
+                changes.size());
             return;
         }
 
         for (const auto& change : changes) {
-            it->second.edit(change, version);
+            try {
+                it->second.edit(change, version);
+            } catch (const std::exception& e) {
+                fprintf(stderr,
+                    "DocumentManager::apply_lsp_changes failed uri=%s version=%d: %s\n",
+                    uri.c_str(),
+                    version,
+                    e.what());
+                return;
+            }
         }
     }
 
-    void update_saved_document_text(const std::string& uri, std::string_view utf8_text) {
+    bool update_saved_document_text(
+        const std::string& uri,
+        std::string_view utf8_text,
+        std::chrono::steady_clock::time_point sync_time = std::chrono::steady_clock::now()) {
         auto it = open_documents_.find(uri);
         if (it == open_documents_.end()) {
-            return;
+            return false;
+        }
+
+        if (should_debounce_saved_document_sync(uri, sync_time)) {
+            fprintf(stderr,
+                "DocumentManager::update_saved_document_text debounced uri=%s within=%lldms\n",
+                uri.c_str(),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(sync_time - last_full_sync_at_.at(uri)).count()));
+            return false;
         }
 
         it->second.setContent(utf8_to_utf16(utf8_text), it->second.getVersion());
+        last_full_sync_at_[uri] = sync_time;
+        return true;
+    }
+
+    bool update_saved_document_from_disk(
+        const std::string& uri,
+        std::chrono::steady_clock::time_point sync_time = std::chrono::steady_clock::now()) {
+        auto it = open_documents_.find(uri);
+        if (it == open_documents_.end()) {
+            return false;
+        }
+
+        if (should_debounce_saved_document_sync(uri, sync_time)) {
+            fprintf(stderr,
+                "DocumentManager::update_saved_document_from_disk debounced uri=%s within=%lldms\n",
+                uri.c_str(),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(sync_time - last_full_sync_at_.at(uri)).count()));
+            return false;
+        }
+
+        try {
+            const TextDocument disk_document = TextDocumentLoader::load_from_file(it->second.getFilePath());
+            it->second.setContent(disk_document.getContent(), it->second.getVersion());
+            last_full_sync_at_[uri] = sync_time;
+            return true;
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "DocumentManager::update_saved_document_from_disk failed uri=%s path=%s: %s\n",
+                uri.c_str(),
+                it->second.getFilePath().string().c_str(),
+                e.what());
+            return false;
+        }
     }
 
     void close_document(const std::string& uri) {
         open_documents_.erase(uri);
-        if (active_document_uri_.has_value() && *active_document_uri_ == uri) {
-            active_document_uri_.reset();
-        }
-    }
-
-    void set_active_document(const std::string& uri) {
-        if (uri.empty()) {
-            active_document_uri_.reset();
-            return;
-        }
-
-        active_document_uri_ = uri;
-    }
-
-    const std::optional<std::string>& active_document_uri() const {
-        return active_document_uri_;
+        last_full_sync_at_.erase(uri);
     }
 
     std::size_t open_document_count() const {
@@ -694,6 +775,24 @@ public:
         });
 
         return documents;
+    }
+
+    std::optional<std::string> document_content_utf8_by_uri(const std::string& uri) const {
+        fprintf(stderr,
+            "DocumentManager::document_content_utf8_by_uri lookup uri=%s open_documents=%zu\n",
+            uri.c_str(),
+            open_documents_.size());
+        const auto it = open_documents_.find(uri);
+        if (it == open_documents_.end()) {
+            fprintf(stderr, "DocumentManager::document_content_utf8_by_uri miss uri=%s\n", uri.c_str());
+            for (const auto& [open_uri, document] : open_documents_) {
+                (void)document;
+                fprintf(stderr, "  open_document uri=%s\n", open_uri.c_str());
+            }
+            return std::nullopt;
+        }
+        fprintf(stderr, "DocumentManager::document_content_utf8_by_uri hit uri=%s\n", uri.c_str());
+        return utf16_to_utf8(it->second.getContent());
     }
 
     bool has_document(const std::string& uri) const {

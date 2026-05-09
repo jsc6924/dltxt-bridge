@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -112,6 +113,7 @@ public:
     }
 
     void write_all(std::string_view data) {
+        fprintf(stderr, "StdioHandle::write_all begin: bytes=%zu\n", data.size());
         std::size_t offset = 0;
         while (offset < data.size()) {
 #ifdef _WIN32
@@ -139,6 +141,7 @@ public:
 
             offset += static_cast<std::size_t>(bytes_written);
         }
+        fprintf(stderr, "StdioHandle::write_all end: bytes=%zu\n", data.size());
     }
 
     void close() {
@@ -227,6 +230,11 @@ public:
             throw boost::system::system_error(net::error::operation_aborted);
         }
 
+        fprintf(stderr,
+            "LocalSession::write_framed enqueue: bytes=%zu queue_size_before=%zu write_in_progress=%d\n",
+            framed_message.size(),
+            write_queue_.size(),
+            write_in_progress_ ? 1 : 0);
         write_queue_.push_back(std::move(framed_message));
         if (write_in_progress_) {
             co_return;
@@ -238,6 +246,10 @@ public:
             while (!write_queue_.empty()) {
                 std::string next = std::move(write_queue_.front());
                 write_queue_.pop_front();
+                fprintf(stderr,
+                    "LocalSession::write_framed flush: bytes=%zu remaining_queue=%zu\n",
+                    next.size(),
+                    write_queue_.size());
 
                 if (auto* socket = std::get_if<std::shared_ptr<tcp::socket>>(&write_target_)) {
                     co_await net::async_write(**socket, net::buffer(next), net::use_awaitable);
@@ -251,6 +263,7 @@ public:
         }
 
         write_in_progress_ = false;
+        fprintf(stderr, "LocalSession::write_framed complete\n");
     }
 
     void register_subscription(const std::string& project_id) {

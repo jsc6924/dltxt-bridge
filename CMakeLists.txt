@@ -33,6 +33,12 @@ configure_file(bridge_version.hpp.in bridge_version.hpp @ONLY)
 add_executable(dltxt_bridge main.cpp)
 set_target_properties(dltxt_bridge PROPERTIES OUTPUT_NAME dltxt_bridge_v3)
 target_include_directories(dltxt_bridge PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${UCHARDET_INCLUDE_DIR})
+add_custom_command(TARGET dltxt_bridge POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_SOURCE_DIR}/../translation-assistant/bin
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:dltxt_bridge>
+    ${CMAKE_CURRENT_SOURCE_DIR}/../translation-assistant/bin/
+)
 
 add_executable(dltxt_bridge_tests tests/protocol_tests.cpp)
 target_include_directories(dltxt_bridge_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${UCHARDET_INCLUDE_DIR})

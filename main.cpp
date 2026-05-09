@@ -6,6 +6,7 @@
 #include "bridge_app.hpp"
 #include "bridge_documents.hpp"
 #include "bridge_http_proxy.hpp"
+#include "bridge_local_requests.hpp"
 #include "bridge_protocol.hpp"
 #include "bridge_runtime.hpp"
 #include "bridge_version.hpp"
@@ -149,8 +150,10 @@ net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session, std::
 }
 
 net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message) {
+    fprintf(stderr, "write_json_message begin: %s\n", message.dump().c_str());
     std::string framed = lsp::frame_message(message.dump());
     co_await session->write_framed(std::move(framed));
+    fprintf(stderr, "write_json_message end\n");
 }
 
 net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& session, const json& id, int code, const std::string& message) {
@@ -171,10 +174,16 @@ public:
 
     void push(std::string message) {
         if (closed_) {
+            fprintf(stderr, "LocalInputQueue push ignored because queue is closed\n");
             return;
         }
 
+        fprintf(stderr,
+            "LocalInputQueue push: payload_bytes=%zu size_before=%zu\n",
+            message.size(),
+            messages_.size());
         messages_.push_back(std::move(message));
+        fprintf(stderr, "LocalInputQueue push complete: size_after=%zu\n", messages_.size());
         signal_.cancel_one();
     }
 
@@ -196,8 +205,14 @@ public:
     net::awaitable<std::optional<std::string>> wait_and_pop() {
         for (;;) {
             if (!messages_.empty()) {
+                const std::size_t size_before = messages_.size();
                 std::string message = std::move(messages_.front());
                 messages_.pop_front();
+                fprintf(stderr,
+                    "LocalInputQueue pop: payload_bytes=%zu size_before=%zu size_after=%zu\n",
+                    message.size(),
+                    size_before,
+                    messages_.size());
                 co_return message;
             }
 
@@ -235,18 +250,26 @@ void start_stdio_reader_thread(
                     buffer);
 
                 if (!maybe_message.has_value()) {
+                    fprintf(stderr, "stdio reader thread: read_message_blocking returned EOF\n");
                     net::post(executor, [input_queue]() {
                         input_queue->close();
                     });
                     return;
                 }
 
+                fprintf(stderr,
+                    "stdio reader thread: got framed payload_bytes=%zu\n",
+                    maybe_message->size());
                 net::post(executor, [input_queue, message = std::move(*maybe_message)]() mutable {
+                    fprintf(stderr,
+                        "stdio reader thread: posting payload into LocalInputQueue, payload_bytes=%zu\n",
+                        message.size());
                     input_queue->push(std::move(message));
                 });
             }
         } catch (...) {
             auto error = std::current_exception();
+            fprintf(stderr, "stdio reader thread: exception, failing LocalInputQueue\n");
             net::post(executor, [input_queue, error]() {
                 input_queue->fail(error);
             });
@@ -259,7 +282,8 @@ net::awaitable<void> handle_local_session(
     std::shared_ptr<LocalSession> session,
     std::shared_ptr<RemoteRegistry> remote_registry,
     std::shared_ptr<LocalSessionManager> session_manager,
-    std::shared_ptr<ResponseManager> response_manager,
+    std::shared_ptr<ResponseManager> remote_response_manager,
+    std::shared_ptr<ResponseManager> local_response_manager,
     std::shared_ptr<bridge_documents::DocumentManager> document_manager,
     std::chrono::milliseconds request_timeout) {
     fprintf(stderr, "Accepted local stdio session\n");
@@ -271,6 +295,7 @@ net::awaitable<void> handle_local_session(
     
     try {
         for (;;) {
+            fprintf(stderr, "handle_local_session: waiting for next queued message\n");
             auto maybe_message = co_await input_queue->wait_and_pop();
             if (!maybe_message.has_value()) {
                 fprintf(stderr, "Local stdio input closed\n");
@@ -278,106 +303,207 @@ net::awaitable<void> handle_local_session(
             }
 
             std::string msg_str = std::move(*maybe_message);
+            fprintf(stderr, "handle_local_session: dequeued payload_bytes=%zu\n", msg_str.size());
             if (msg_str.empty()) {
+                fprintf(stderr, "handle_local_session: skipping empty payload\n");
                 continue;
             }
-            
-            // Parse JSON-RPC
-            bool parse_error = false;
+
             json request;
+            std::string method = "<unparsed>";
+            std::optional<json> message_error_id;
+            bool message_failed = false;
+            std::string message_error;
             
             try {
                 request = json::parse(msg_str);
             } catch (const std::exception& e) {
                 fprintf(stderr, "JSON parse error: %s\n", e.what());
-                parse_error = true;
-            }
-            
-            if (parse_error) continue;
-            
-            // Validate JSON-RPC request
-            if (!request.contains("jsonrpc") || request["jsonrpc"] != "2.0") {
-                if (request.contains("id")) {
-                    co_await write_json_error(session, request["id"], -32600, "Invalid Request");
-                }
                 continue;
             }
-            
-            if (!request.contains("method")) {
-                if (request.contains("id")) {
-                    co_await write_json_error(session, request["id"], -32600, "Missing method");
-                }
-                continue;
-            }
-            
-            fprintf(stderr, "JSON-RPC Request: %s\n", request.dump().c_str());
 
-            bridge_local::RequestContext request_context{document_manager};
-            auto local_handling = bridge_local::handle_request(session, request, &request_context);
-            if (!local_handling.forward_to_remote) {
-                if (local_handling.response.has_value()) {
-                    co_await write_json_message(session, *local_handling.response);
-                }
-
-                if (local_handling.directive == bridge_local::SessionDirective::mark_shutdown_requested) {
-                    shutdown_requested = true;
-                } else if (local_handling.directive == bridge_local::SessionDirective::close_session) {
-                    fprintf(stderr,
-                        shutdown_requested
-                            ? "Closing local session after exit notification following shutdown\n"
-                            : "Closing local session after exit notification without prior shutdown\n"
-                    );
-                    session->close();
-                    session_manager->unregister(session);
-                    co_return;
-                }
-
-                continue;
-            }
-            
-            auto remote = remote_registry->get();
-            if (!remote) {
-                if (request.contains("id")) {
-                    co_await write_json_error(session, request["id"], -32000, "Remote server unavailable");
-                }
-                continue;
-            }
-            
             if (request.contains("id")) {
-                auto maybe_id = jsonrpc::request_id_from_json(request["id"]);
-                if (!maybe_id.has_value() || !jsonrpc::is_trackable_request_id(*maybe_id)) {
-                    co_await write_json_error(session, request["id"], -32600, "Invalid Request id");
+                message_error_id = request["id"];
+            }
+
+            if (bridge_local::try_store_jsonrpc_response(request, local_response_manager)) {
+                fprintf(stderr, "handle_local_session: stored local response id=%s\n", request["id"].dump().c_str());
+                continue;
+            }
+
+            if (request.is_object()
+                && request.contains("jsonrpc")
+                && request["jsonrpc"] == "2.0"
+                && request.contains("id")
+                && (request.contains("result") || request.contains("error"))) {
+                fprintf(stderr,
+                    "handle_local_session: ignoring unmatched local response id=%s\n",
+                    request["id"].dump().c_str());
+                continue;
+            }
+
+            try {
+                // Validate JSON-RPC request
+                if (!request.contains("jsonrpc") || request["jsonrpc"] != "2.0") {
+                    if (request.contains("id")) {
+                        co_await write_json_error(session, request["id"], -32600, "Invalid Request");
+                    }
                     continue;
                 }
 
-                RequestId original_id = *maybe_id;
-                json original_id_json = request["id"];
-                auto executor = co_await net::this_coro::executor;
-                RequestId bridge_id = response_manager->create_bridge_request_id(original_id, executor, request_timeout);
-                request["id"] = jsonrpc::request_id_to_json(bridge_id);
-
-                // RAII Guard: Automatically calls cleanup(id) when this object goes out of scope
-                ResponseCleanup guard{response_manager, bridge_id};
-
-                // Forward request to Go
-                co_await remote->send(request.dump());
-
-                auto wait_result = co_await response_manager->wait_for_response(bridge_id);
-
-                if (wait_result.status == ResponseManager::WaitStatus::response_ready && wait_result.response.has_value()) {
-                    co_await write_json_message(session, *wait_result.response);
-                } else if (wait_result.status == ResponseManager::WaitStatus::timed_out) {
-                    co_await write_json_error(session, original_id_json, -32001, "Request timed out");
-                } else if (wait_result.status == ResponseManager::WaitStatus::cancelled) {
-                    co_await write_json_error(session, original_id_json, -32002, "Remote server disconnected while awaiting response");
+                if (!request.contains("method")) {
+                    if (request.contains("id")) {
+                        co_await write_json_error(session, request["id"], -32600, "Missing method");
+                    }
+                    continue;
                 }
-            } else {
-                // It's a notification, just fire and forget
-                co_await remote->send(request.dump());
+
+                fprintf(stderr, "JSON-RPC Request: %s\n", request.dump().c_str());
+                method = request["method"].get<std::string>();
+
+                bridge_local::RequestContext request_context{document_manager};
+                auto local_handling = bridge_local::handle_request(session, request, &request_context);
+                fprintf(stderr,
+                    "handle_local_session: method=%s forward_to_remote=%d has_response=%d directive=%d\n",
+                    method.c_str(),
+                    local_handling.forward_to_remote ? 1 : 0,
+                    local_handling.response.has_value() ? 1 : 0,
+                    static_cast<int>(local_handling.directive));
+                if (!local_handling.forward_to_remote) {
+                    if (local_handling.response.has_value()) {
+                        fprintf(stderr,
+                            "handle_local_session: writing local response for method=%s id=%s\n",
+                            method.c_str(),
+                            request.value("id", json(nullptr)).dump().c_str());
+                        co_await write_json_message(session, *local_handling.response);
+                        fprintf(stderr,
+                            "handle_local_session: finished local response for method=%s id=%s\n",
+                            method.c_str(),
+                            request.value("id", json(nullptr)).dump().c_str());
+                    }
+
+                    if (local_handling.directive == bridge_local::SessionDirective::mark_shutdown_requested) {
+                        shutdown_requested = true;
+                    } else if (local_handling.directive == bridge_local::SessionDirective::close_session) {
+                        fprintf(stderr,
+                            shutdown_requested
+                                ? "Closing local session after exit notification following shutdown\n"
+                                : "Closing local session after exit notification without prior shutdown\n"
+                        );
+                        session->close();
+                        session_manager->unregister(session);
+                        co_return;
+                    }
+
+                    continue;
+                }
+
+                auto remote = remote_registry->get();
+                if (!remote) {
+                    if (request.contains("id")) {
+                        co_await write_json_error(session, request["id"], -32000, "Remote server unavailable");
+                    }
+                    continue;
+                }
+
+                if (request.contains("id")) {
+                    auto maybe_id = jsonrpc::request_id_from_json(request["id"]);
+                    if (!maybe_id.has_value() || !jsonrpc::is_trackable_request_id(*maybe_id)) {
+                        co_await write_json_error(session, request["id"], -32600, "Invalid Request id");
+                        continue;
+                    }
+
+                    RequestId original_id = *maybe_id;
+                    json original_id_json = request["id"];
+                    auto executor = co_await net::this_coro::executor;
+                    RequestId bridge_id = remote_response_manager->create_bridge_request_id(original_id, executor, request_timeout);
+                    request["id"] = jsonrpc::request_id_to_json(bridge_id);
+                    fprintf(stderr,
+                        "handle_local_session: forwarding request method=%s original_id=%s bridge_id=%s timeout_ms=%lld\n",
+                        method.c_str(),
+                        original_id_json.dump().c_str(),
+                        request["id"].dump().c_str(),
+                        static_cast<long long>(request_timeout.count()));
+
+                    ResponseCleanup guard{remote_response_manager, bridge_id};
+
+                    bool remote_send_failed = false;
+                    std::string remote_send_error;
+                    try {
+                        co_await remote->send(request.dump());
+                    } catch (const std::exception& e) {
+                        remote_send_failed = true;
+                        remote_send_error = e.what();
+                    } catch (...) {
+                        remote_send_failed = true;
+                        remote_send_error = "unknown exception";
+                    }
+
+                    if (remote_send_failed) {
+                        fprintf(stderr,
+                            "handle_local_session: remote send failed for request method=%s original_id=%s: %s\n",
+                            method.c_str(),
+                            original_id_json.dump().c_str(),
+                            remote_send_error.c_str());
+                        co_await write_json_error(session, original_id_json, -32000, "Remote server unavailable");
+                        continue;
+                    }
+                    fprintf(stderr,
+                        "handle_local_session: request sent to remote, waiting for response bridge_id=%s\n",
+                        request["id"].dump().c_str());
+
+                    auto wait_result = co_await remote_response_manager->wait_for_response(bridge_id);
+                    fprintf(stderr,
+                        "handle_local_session: remote wait finished method=%s status=%d has_response=%d\n",
+                        method.c_str(),
+                        static_cast<int>(wait_result.status),
+                        wait_result.response.has_value() ? 1 : 0);
+
+                    if (wait_result.status == ResponseManager::WaitStatus::response_ready && wait_result.response.has_value()) {
+                        co_await write_json_message(session, *wait_result.response);
+                    } else if (wait_result.status == ResponseManager::WaitStatus::timed_out) {
+                        co_await write_json_error(session, original_id_json, -32001, "Request timed out");
+                    } else if (wait_result.status == ResponseManager::WaitStatus::cancelled) {
+                        co_await write_json_error(session, original_id_json, -32002, "Remote server disconnected while awaiting response");
+                    }
+                } else {
+                    try {
+                        co_await remote->send(request.dump());
+                    } catch (const std::exception& e) {
+                        fprintf(stderr,
+                            "handle_local_session: remote send failed for notification method=%s: %s\n",
+                            method.c_str(),
+                            e.what());
+                    } catch (...) {
+                        fprintf(stderr,
+                            "handle_local_session: remote send failed for notification method=%s: unknown exception\n",
+                            method.c_str());
+                    }
+                }
+            } catch (const std::exception& e) {
+                message_failed = true;
+                message_error = e.what();
+            } catch (...) {
+                message_failed = true;
+                message_error = "unknown exception";
+            }
+
+            if (message_failed) {
+                fprintf(stderr,
+                    "handle_local_session: message processing failed for method=%s id=%s: %s\n",
+                    method.c_str(),
+                    message_error_id.has_value() ? message_error_id->dump().c_str() : "null",
+                    message_error.c_str());
+                if (message_error_id.has_value()) {
+                    co_await write_json_error(session, *message_error_id, -32603, "Internal error");
+                }
+                continue;
             }
         }
-    } catch (...) { 
-        fprintf(stderr, "Closing local stdio session after transport failure\n");
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Closing local stdio session after transport failure: %s\n", e.what());
+    } catch (...) {
+        fprintf(stderr, "Closing local stdio session after transport failure: unknown exception\n");
     }
 
     session->close();
@@ -441,7 +567,8 @@ int main(int argc, char* argv[]) {
 
         auto remote_registry = std::make_shared<RemoteRegistry>();
         auto session_manager = std::make_shared<LocalSessionManager>();
-        auto response_manager = std::make_shared<ResponseManager>();
+        auto remote_response_manager = std::make_shared<ResponseManager>();
+        auto local_response_manager = std::make_shared<ResponseManager>();
         auto document_manager = std::make_shared<bridge_documents::DocumentManager>();
         auto http_proxy_service = std::make_shared<bridge_http::MojiProxyService>(ioc.get_executor(), dltxt_bridge::version);
         auto local_input = open_stdio_input_handle();
@@ -450,16 +577,16 @@ int main(int argc, char* argv[]) {
         start_stdio_reader_thread(ioc.get_executor(), local_input, local_input_queue);
 
         // Launch ONE coordinator coroutine to handle startup order
-        net::co_spawn(ioc, [remote_registry, session_manager, response_manager, document_manager, local_input_queue, local_session, settings]() mutable -> net::awaitable<void> {
+        net::co_spawn(ioc, [remote_registry, session_manager, remote_response_manager, local_response_manager, document_manager, local_input_queue, local_session, settings]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
-            net::co_spawn(ex, handle_local_session(local_input_queue, local_session, remote_registry, session_manager, response_manager, document_manager, settings.request_timeout), net::detached);
+            net::co_spawn(ex, handle_local_session(local_input_queue, local_session, remote_registry, session_manager, remote_response_manager, local_response_manager, document_manager, settings.request_timeout), net::detached);
 
             co_await run_remote_retry_loop(
                 remote_registry,
                 [settings](net::any_io_executor executor) {
                     return std::make_shared<RemoteClient>(executor, settings.remote_port == "443");
                 },
-                [session_manager, response_manager, settings](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
+                [session_manager, remote_response_manager, local_response_manager, settings](const std::shared_ptr<RemoteClient>& remote_client_ptr) -> net::awaitable<void> {
                     auto executor = co_await net::this_coro::executor;
                     auto notification_queue = std::make_shared<RemoteNotificationQueue>(executor);
                     net::co_spawn(
@@ -473,15 +600,17 @@ int main(int argc, char* argv[]) {
                         co_await remote_client_ptr->connect(settings.remote_host, settings.remote_port);
 
                         // Start the loops that depend on that connection
-                        co_await remote_reader(remote_client_ptr, response_manager, notification_queue);
+                        co_await remote_reader(remote_client_ptr, remote_response_manager, notification_queue);
                     } catch (...) {
                         notification_queue->close();
-                        response_manager->cancel_all();
+                        remote_response_manager->cancel_all();
+                        local_response_manager->cancel_all();
                         throw;
                     }
 
                     notification_queue->close();
-                    response_manager->cancel_all();
+                    remote_response_manager->cancel_all();
+                    local_response_manager->cancel_all();
                 },
                 [](std::exception_ptr error) {
                     try {
