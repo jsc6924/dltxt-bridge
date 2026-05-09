@@ -805,6 +805,124 @@ DEFINE_TEST(test_local_initialize_and_active_editor_update_document_manager) {
     assert(*manager->active_document_uri() == "file:///c:/repo/doc.txt");
 }
 
+DEFINE_TEST(test_local_handler_returns_opened_documents_contents) {
+    auto manager = std::make_shared<bridge_documents::DocumentManager>();
+    bridge_local::RequestContext context{manager};
+
+    manager->open_from_lsp("file:///c:/repo/b.txt", "second document", 1);
+    manager->open_from_lsp("file:///c:/repo/a.txt", "first\ndocument", 2);
+
+    const json request = json{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "dltxt/opened_documents"}};
+    const auto handling = bridge_local::handle_request(nullptr, request, &context);
+
+    assert(!handling.forward_to_remote);
+    assert(handling.response.has_value());
+    assert((*handling.response)["jsonrpc"] == "2.0");
+    assert((*handling.response)["id"] == 7);
+    assert((*handling.response)["result"].is_object());
+    assert((*handling.response)["result"].size() == 2);
+    assert((*handling.response)["result"]["file:///c:/repo/a.txt"] == "first\ndocument");
+    assert((*handling.response)["result"]["file:///c:/repo/b.txt"] == "second document");
+}
+
+DEFINE_TEST(test_text_document_edit_splits_single_line_when_patch_contains_newline) {
+    bridge_documents::TextDocument document(
+        "file:///c:/repo/doc.txt",
+        "client-decoded",
+        "c:/repo/doc.txt",
+        1,
+        bridge_documents::utf8_to_utf16("hello world"));
+
+    document.edit(
+        bridge_documents::TextChange{
+            bridge_documents::Range{
+                bridge_documents::Position{0, 5},
+                bridge_documents::Position{0, 6}
+            },
+            bridge_documents::utf8_to_utf16("\n")
+        },
+        2);
+
+    assert(document.getVersion() == 2);
+    assert(document.getLines().size() == 2);
+    assert(bridge_documents::utf16_to_utf8(document.getLine(0)) == "hello");
+    assert(bridge_documents::utf16_to_utf8(document.getLine(1)) == "world");
+}
+
+DEFINE_TEST(test_text_document_edit_single_line_patch_only_changes_target_line) {
+    bridge_documents::TextDocument document(
+        "file:///c:/repo/doc.txt",
+        "client-decoded",
+        "c:/repo/doc.txt",
+        1,
+        bridge_documents::utf8_to_utf16("line0\nline1\nline2"));
+
+    document.edit(
+        bridge_documents::TextChange{
+            bridge_documents::Range{
+                bridge_documents::Position{1, 1},
+                bridge_documents::Position{1, 4}
+            },
+            bridge_documents::utf8_to_utf16("XYZ")
+        },
+        2);
+
+    assert(document.getVersion() == 2);
+    assert(document.getLines().size() == 3);
+    assert(bridge_documents::utf16_to_utf8(document.getLine(0)) == "line0");
+    assert(bridge_documents::utf16_to_utf8(document.getLine(1)) == "lXYZe1");
+    assert(bridge_documents::utf16_to_utf8(document.getLine(2)) == "line2");
+}
+
+DEFINE_TEST(test_text_document_edit_collapses_multi_line_range_into_single_line) {
+    bridge_documents::TextDocument document(
+        "file:///c:/repo/doc.txt",
+        "client-decoded",
+        "c:/repo/doc.txt",
+        1,
+        bridge_documents::utf8_to_utf16("abc\ndef\nghi"));
+
+    document.edit(
+        bridge_documents::TextChange{
+            bridge_documents::Range{
+                bridge_documents::Position{0, 1},
+                bridge_documents::Position{2, 2}
+            },
+            bridge_documents::utf8_to_utf16("Z")
+        },
+        3);
+
+    assert(document.getVersion() == 3);
+    assert(document.getLines().size() == 1);
+    assert(bridge_documents::utf16_to_utf8(document.getLine(0)) == "aZi");
+}
+
+DEFINE_TEST(test_text_document_edit_expands_multi_line_range_with_multi_line_patch) {
+    bridge_documents::TextDocument document(
+        "file:///c:/repo/doc.txt",
+        "client-decoded",
+        "c:/repo/doc.txt",
+        1,
+        bridge_documents::utf8_to_utf16("abc\ndef\nghi\njkl"));
+
+    document.edit(
+        bridge_documents::TextChange{
+            bridge_documents::Range{
+                bridge_documents::Position{0, 1},
+                bridge_documents::Position{2, 2}
+            },
+            bridge_documents::utf8_to_utf16("X\nY\nZ")
+        },
+        4);
+
+    assert(document.getVersion() == 4);
+    assert(document.getLines().size() == 5);
+    assert(bridge_documents::utf16_to_utf8(document.getLine(0)) == "aX");
+    assert(bridge_documents::utf16_to_utf8(document.getLine(1)) == "Y");
+    assert(bridge_documents::utf16_to_utf8(document.getLine(2)) == "Zi");
+    assert(bridge_documents::utf16_to_utf8(document.getLine(3)) == "jkl");
+}
+
 DEFINE_TEST(test_response_manager_round_trip) {
     net::io_context ioc;
     auto manager = std::make_shared<ResponseManager>();

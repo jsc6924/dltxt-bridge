@@ -130,11 +130,14 @@ inline std::vector<std::u16string> split_lines(std::u16string_view text) {
     std::size_t start = 0;
 
     for (std::size_t index = 0; index < text.size(); ++index) {
-        if (text[index] != u'\n') {
+        if (text[index] != u'\n' && text[index] != u'\r') {
             continue;
         }
 
         lines.emplace_back(text.substr(start, index - start));
+        if (text[index] == u'\r' && index + 1 < text.size() && text[index + 1] == u'\n') {
+            ++index;
+        }
         start = index + 1;
     }
 
@@ -296,7 +299,7 @@ inline std::u16string utf16le_bytes_to_string(std::string_view bytes) {
         text.erase(text.begin());
     }
 
-    return normalize_newlines(text);
+    return text;
 }
 
 inline std::u16string convert_to_utf16(std::string_view input, const std::string& from_encoding) {
@@ -353,7 +356,7 @@ inline std::u16string convert_to_utf16(std::string_view input, const std::string
             text.push_back(static_cast<char16_t>(0xDC00U + (codepoint & 0x3FFU)));
         }
 
-        return normalize_newlines(text);
+        return text;
     };
 
     if (normalized_encoding == "UTF-32LE") {
@@ -401,7 +404,7 @@ inline std::u16string convert_to_utf16(std::string_view input, const std::string
         throw std::runtime_error("MultiByteToWideChar conversion failed");
     }
 
-    return normalize_newlines(std::u16string(wide_text.begin(), wide_text.end()));
+    return std::u16string(wide_text.begin(), wide_text.end());
 #else
     return utf16le_bytes_to_string(convert_bytes(input, from_encoding.c_str(), "UTF-16LE"));
 #endif
@@ -462,20 +465,6 @@ class TextDocument {
     int version_ = 0;
     std::vector<std::u16string> lines_;
 
-    std::size_t content_offset(const Position& position) const {
-        if (position.line >= lines_.size()) {
-            throw std::out_of_range("line out of range");
-        }
-
-        std::size_t offset = 0;
-        for (std::size_t line_index = 0; line_index < position.line; ++line_index) {
-            offset += lines_[line_index].size() + 1U;
-        }
-
-        const std::size_t character = (std::min)(position.character, lines_[position.line].size());
-        return offset + character;
-    }
-
 public:
     TextDocument() = default;
 
@@ -490,7 +479,7 @@ public:
           file_path_(std::move(file_path)),
           file_name_(file_path_.filename().string()),
           version_(version),
-          lines_(split_lines(normalize_newlines(content))) {}
+          lines_(split_lines(content)) {}
 
     const std::string& getUri() const {
         return uri_;
@@ -538,7 +527,7 @@ public:
 
     void setContent(std::u16string content, int version) {
         version_ = version;
-        lines_ = split_lines(normalize_newlines(content));
+        lines_ = split_lines(content);
     }
 
     void edit(const TextChange& change, int version) {
@@ -547,15 +536,46 @@ public:
             return;
         }
 
-        std::u16string content = getContent();
-        const std::size_t start_offset = content_offset(change.range->start);
-        const std::size_t end_offset = content_offset(change.range->end);
-        if (end_offset < start_offset || end_offset > content.size()) {
-            throw std::out_of_range("range out of bounds");
+        const auto startLine = change.range->start.line;
+        const auto startChar = change.range->start.character;
+        const auto endLine = change.range->end.line;
+        const auto endChar = change.range->end.character;
+        auto patch = split_lines(change.text);
+        if (startLine == endLine && patch.size() == 1) {
+            auto& line = lines_[startLine];
+            line.replace(startChar, endChar - startChar, patch[0]);
+            version_ = version;
+            return;
         }
 
-        content.replace(start_offset, end_offset - start_offset, normalize_newlines(change.text));
-        setContent(std::move(content), version);
+        std::u16string newStartLine = lines_[startLine].substr(0, startChar) + patch.front();
+        std::u16string newEndLine = patch.back() + lines_[endLine].substr(endChar);
+
+        const auto replacedLineCount = endLine - startLine + 1;
+        const auto newLineCount = lines_.size() - replacedLineCount + patch.size();
+        auto newLines = std::vector<std::u16string>();
+        newLines.reserve(newLineCount);
+
+        for (size_t i = 0; i < startLine; ++i) {
+            newLines.push_back(std::move(lines_[i]));
+        }
+
+        if (patch.size() == 1) {
+            newLines.push_back(std::move(newStartLine) + lines_[endLine].substr(endChar));
+        } else {
+            newLines.push_back(std::move(newStartLine));
+            for (size_t i = 1; i + 1 < patch.size(); ++i) {
+                newLines.push_back(std::move(patch[i]));
+            }
+            newLines.push_back(std::move(newEndLine));
+        }
+
+        for (size_t i = endLine + 1; i < lines_.size(); ++i) {
+            newLines.push_back(std::move(lines_[i]));
+        }
+
+        lines_ = std::move(newLines);
+        version_ = version;
     }
 };
 
@@ -659,6 +679,21 @@ public:
 
     std::size_t open_document_count() const {
         return open_documents_.size();
+    }
+
+    std::vector<std::pair<std::string, std::string>> opened_document_contents_utf8_by_uri() const {
+        std::vector<std::pair<std::string, std::string>> documents;
+        documents.reserve(open_documents_.size());
+
+        for (const auto& [uri, document] : open_documents_) {
+            documents.emplace_back(uri, utf16_to_utf8(document.getContent()));
+        }
+
+        std::sort(documents.begin(), documents.end(), [](const auto& left, const auto& right) {
+            return left.first < right.first;
+        });
+
+        return documents;
     }
 
     bool has_document(const std::string& uri) const {

@@ -688,6 +688,23 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
         );
     }
 
+    if (method == "dltxt/opened_documents") {
+        if (!request.contains("id")) {
+            return {};
+        }
+
+        json contents = json::object();
+        if (context != nullptr && context->document_manager) {
+            for (const auto& [uri, content] : context->document_manager->opened_document_contents_utf8_by_uri()) {
+                contents[uri] = content;
+            }
+        }
+
+        return RequestResult::local_response(
+            jsonrpc::create_response(request["id"], std::move(contents))
+        );
+    }
+
     if (!request.contains("id")) {
         return {};
     }
