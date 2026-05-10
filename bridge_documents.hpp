@@ -666,6 +666,10 @@ public:
         return workspace_folders_;
     }
 
+    std::vector<std::string> workspace_folders_snapshot() const {
+        return workspace_folders_;
+    }
+
     void upsert_open_document(TextDocument document) {
         last_full_sync_at_.erase(document.getUri());
         open_documents_[document.getUri()] = std::move(document);
@@ -802,6 +806,31 @@ public:
     const TextDocument* find_document(const std::string& uri) const {
         const auto it = open_documents_.find(uri);
         return it != open_documents_.end() ? &it->second : nullptr;
+    }
+
+    std::optional<TextDocument> document_snapshot(const std::string& uri) const {
+        const auto it = open_documents_.find(uri);
+        if (it == open_documents_.end()) {
+            return std::nullopt;
+        }
+
+        return it->second;
+    }
+
+    std::vector<TextDocument> open_documents_snapshot() const {
+        std::vector<TextDocument> documents;
+        documents.reserve(open_documents_.size());
+
+        for (const auto& [uri, document] : open_documents_) {
+            (void)uri;
+            documents.push_back(document);
+        }
+
+        std::sort(documents.begin(), documents.end(), [](const TextDocument& left, const TextDocument& right) {
+            return left.getUri() < right.getUri();
+        });
+
+        return documents;
     }
 };
 

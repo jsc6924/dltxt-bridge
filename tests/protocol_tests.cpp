@@ -16,6 +16,7 @@
 
 #include "../local_session.hpp"
 #include "../bridge_app.hpp"
+#include "../bridge_crossref.hpp"
 #include "../bridge_documents.hpp"
 #include "../bridge_http_proxy.hpp"
 #include "../batch.hpp"
@@ -870,9 +871,39 @@ DEFINE_TEST(test_shared_thread_pool_can_initialize_and_shutdown) {
     assert(!bridge_runtime::shared_thread_pool_initialized());
 }
 
+DEFINE_TEST(test_shared_thread_pool_defaults_to_at_least_two_threads) {
+    bridge_runtime::shutdown_shared_thread_pool();
+    bridge_runtime::initialize_shared_thread_pool(1);
+
+    std::atomic<int> counter = 0;
+    std::latch done(2);
+    boost::asio::post(bridge_runtime::shared_thread_pool(), [&]() {
+        ++counter;
+        done.count_down();
+    });
+    boost::asio::post(bridge_runtime::shared_thread_pool(), [&]() {
+        ++counter;
+        done.count_down();
+    });
+    done.wait();
+
+    assert(counter == 2);
+
+    bridge_runtime::shutdown_shared_thread_pool();
+}
+
 DEFINE_TEST(test_utf_conversions_accept_empty_strings) {
     assert(bridge_documents::utf8_to_utf16("").empty());
     assert(bridge_documents::utf16_to_utf8(std::u16string{}).empty());
+}
+
+DEFINE_TEST(test_utf_conversions_preserve_japanese_quotes_and_markers) {
+    const std::u16string original = u"\u2605txt00641\u2605\u300C\u308F\u3001\u308F\u3041\u3042\u3063\uFF01\uFF1F\u300D";
+
+    const std::string utf8 = bridge_documents::utf16_to_utf8(original);
+    const std::u16string round_tripped = bridge_documents::utf8_to_utf16(utf8);
+
+    assert(round_tripped == original);
 }
 
 DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
@@ -1071,26 +1102,6 @@ DEFINE_TEST(test_local_initialize_updates_document_manager_workspace_folders) {
     assert(manager->workspace_folders()[0] == "file:///c:/repo");
 }
 
-DEFINE_TEST(test_local_handler_returns_opened_documents_contents) {
-    auto manager = std::make_shared<bridge_documents::DocumentManager>();
-    bridge_local::RequestContext context{manager};
-
-    manager->open_from_lsp("file:///c:/repo/b.txt", "second document", 1);
-    manager->open_from_lsp("file:///c:/repo/a.txt", "first\ndocument", 2);
-
-    const json request = json{{"jsonrpc", "2.0"}, {"id", 7}, {"method", "dltxt/opened_documents"}};
-    const auto handling = bridge_local::handle_request(nullptr, request, &context);
-
-    assert(!handling.forward_to_remote);
-    assert(handling.response.has_value());
-    assert((*handling.response)["jsonrpc"] == "2.0");
-    assert((*handling.response)["id"] == 7);
-    assert((*handling.response)["result"].is_object());
-    assert((*handling.response)["result"].size() == 2);
-    assert((*handling.response)["result"]["file:///c:/repo/a.txt"] == "first\ndocument");
-    assert((*handling.response)["result"]["file:///c:/repo/b.txt"] == "second document");
-}
-
 DEFINE_TEST(test_similarity_index_returns_best_match_with_metadata) {
     bridge_similarity::SimilarityIndex index;
     index.upsert(1, "c:/repo/a.txt", 2, u"alphaalpha");
@@ -1217,6 +1228,343 @@ DEFINE_TEST(test_similarity_index_replaces_japanese_utf16_escape_content) {
     assert(refreshed_results[0].line_id == 31);
 }
 
+DEFINE_TEST(test_similarity_index_prefers_exact_match_with_many_common_candidates) {
+    bridge_similarity::SimilarityIndex index;
+
+    for (std::size_t i = 0; i < 600; ++i) {
+        std::u16string text = u"common-prefix-abcdefghijklmnop-";
+        text += static_cast<char16_t>(u'a' + static_cast<char16_t>(i % 26));
+        text += static_cast<char16_t>(u'a' + static_cast<char16_t>((i / 26) % 26));
+        text += static_cast<char16_t>(u'a' + static_cast<char16_t>((i / (26 * 26)) % 26));
+        index.upsert(1000 + i, "c:/repo/common-" + std::to_string(i) + ".txt", i, text);
+    }
+
+    const std::u16string exact = u"common-prefix-abcdefghijklmnop-xyz";
+    index.upsert(9999, "c:/repo/exact.txt", 42, exact);
+
+    const auto results = index.search(exact, 0.0, 5);
+
+    assert(!results.empty());
+    assert(results[0].line_id == 9999);
+    assert(results[0].file_path == "c:/repo/exact.txt");
+    assert(results[0].line_number == 42);
+}
+
+DEFINE_TEST(test_crossref_service_returns_bridge_matches_for_open_documents) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+    const bridge_text::StandardTextParser parser(config);
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_workspace";
+    std::filesystem::create_directories(workspace_path);
+    const auto current_file_path = workspace_path / "current.txt";
+    const auto other_file_path = workspace_path / "other.txt";
+
+    {
+        std::ofstream output(current_file_path, std::ios::binary);
+        output << white_circle << "0001T" << white_circle << "old\n"
+               << black_circle << "0001T" << black_circle << "old\n";
+    }
+    {
+        std::ofstream output(other_file_path, std::ios::binary);
+        output << white_circle << "0002T" << white_circle << "miss\n"
+               << black_circle << "0002T" << black_circle << "miss\n";
+    }
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+
+    const std::string current_uri = bridge_documents::file_uri_from_path(current_file_path);
+    const std::string other_uri = bridge_documents::file_uri_from_path(other_file_path);
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0001T" + black_circle + "hello\n",
+        3);
+    manager.open_from_lsp(
+        other_uri,
+        white_circle + "0002T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0002T" + black_circle + "world\n",
+        4);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const json parser_payload = json{
+        {"originalPrefixRegex", config.original_prefix_regex},
+        {"translatedPrefixRegex", config.translated_prefix_regex},
+        {"otherPrefixRegex", config.other_prefix_regex},
+        {"originalWhiteRegex", config.original_white_regex},
+        {"translatedWhiteRegex", config.translated_white_regex},
+        {"originalSuffixRegex", config.original_suffix_regex},
+        {"translatedSuffixRegex", config.translated_suffix_regex},
+    };
+    service.update_parser_config(
+        parser_payload,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["lineNumber"] == 0);
+    assert(result["matches"][0]["exactCount"] == 1);
+    assert(result["matches"][0]["refs"].size() == 1);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["fileName"] == other_file_path.string());
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["trLine"] == "world");
+    assert(result["matches"][0]["refs"][0]["score"] == 100);
+
+    std::filesystem::remove_all(workspace_path);
+}
+
+DEFINE_TEST(test_crossref_service_preserves_japanese_quotes_in_json_results) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const std::string quoted_jp = bridge_documents::utf16_to_utf8(u"\u300C\u308F\u3001\u308F\u3041\u3042\u3063\uFF01\uFF1F\u300D");
+    const std::string translated = bridge_documents::utf16_to_utf8(u"\u300C\u54C7\u3001\u54C7\u554A\u554A\uFF01\uFF1F\u300D");
+
+    bridge_documents::DocumentManager manager;
+    const std::string current_uri = "file:///c:/tmp/current.txt";
+    const std::string other_uri = "file:///c:/tmp/other.txt";
+    manager.set_workspace_folders({"file:///c:/tmp"});
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + quoted_jp + "\n"
+            + black_circle + "0001T" + black_circle + translated + "\n",
+        1);
+    manager.open_from_lsp(
+        other_uri,
+        white_circle + "0002T" + white_circle + quoted_jp + "\n"
+            + black_circle + "0002T" + black_circle + translated + "\n",
+        1);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const json parser_payload = json{
+        {"originalPrefixRegex", config.original_prefix_regex},
+        {"translatedPrefixRegex", config.translated_prefix_regex},
+        {"otherPrefixRegex", config.other_prefix_regex},
+        {"originalWhiteRegex", config.original_white_regex},
+        {"translatedWhiteRegex", config.translated_white_regex},
+        {"originalSuffixRegex", config.original_suffix_regex},
+        {"translatedSuffixRegex", config.translated_suffix_regex},
+    };
+
+    service.update_parser_config(
+        parser_payload,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["refs"].size() == 1);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["jpLine"] == quoted_jp);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["trLine"] == translated);
+}
+
+DEFINE_TEST(test_crossref_service_preserves_japanese_quotes_in_disk_loaded_json_results) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const std::string quoted_jp = bridge_documents::utf16_to_utf8(u"\u300C\u308F\u3001\u308F\u3041\u3042\u3063\uFF01\uFF1F\u300D");
+    const std::string translated = bridge_documents::utf16_to_utf8(u"\u300C\u54C7\u3001\u54C7\u554A\u554A\uFF01\uFF1F\u300D");
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_disk_utf16_workspace";
+    std::filesystem::create_directories(workspace_path);
+    const auto other_file_path = workspace_path / "other.txt";
+
+    {
+        const std::u16string disk_text = bridge_documents::utf8_to_utf16(
+            white_circle + "0002T" + white_circle + quoted_jp + "\r\n"
+                + black_circle + "0002T" + black_circle + translated + "\r\n");
+        std::ofstream output(other_file_path, std::ios::binary);
+        const unsigned char bom[] = {0xFF, 0xFE};
+        output.write(reinterpret_cast<const char*>(bom), static_cast<std::streamsize>(sizeof(bom)));
+        for (char16_t ch : disk_text) {
+            const unsigned char lo = static_cast<unsigned char>(ch & 0x00FFu);
+            const unsigned char hi = static_cast<unsigned char>((ch >> 8u) & 0x00FFu);
+            output.put(static_cast<char>(lo));
+            output.put(static_cast<char>(hi));
+        }
+    }
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+    const std::string current_uri = bridge_documents::file_uri_from_path(workspace_path / "current.txt");
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + quoted_jp + "\n"
+            + black_circle + "0001T" + black_circle + translated + "\n",
+        1);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const json parser_payload = json{
+        {"originalPrefixRegex", config.original_prefix_regex},
+        {"translatedPrefixRegex", config.translated_prefix_regex},
+        {"otherPrefixRegex", config.other_prefix_regex},
+        {"originalWhiteRegex", config.original_white_regex},
+        {"translatedWhiteRegex", config.translated_white_regex},
+        {"originalSuffixRegex", config.original_suffix_regex},
+        {"translatedSuffixRegex", config.translated_suffix_regex},
+    };
+
+    service.update_parser_config(
+        parser_payload,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["refs"].size() == 1);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["fileName"] == other_file_path.string());
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["jpLine"] == quoted_jp);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["trLine"] == translated);
+
+    std::filesystem::remove_all(workspace_path);
+}
+
+DEFINE_TEST(test_crossref_service_ignores_non_file_like_current_uri) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+    const bridge_text::StandardTextParser parser(config);
+
+    bridge_crossref::CrossrefService service;
+    bridge_documents::TextDocument document(
+        "output:extension-output-jsc723.translateassistant-%233-DLTXT%20Bridge%20stderr",
+        "client-decoded",
+        "output:extension-output-jsc723.translateassistant-%233-DLTXT%20Bridge%20stderr",
+        1,
+        bridge_documents::utf8_to_utf16("ignored"));
+
+    const json result = service.search_json(document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].empty());
+}
+
+DEFINE_TEST(test_crossref_service_skips_lines_when_exact_count_reaches_limit) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_exact_limit";
+    std::filesystem::create_directories(workspace_path);
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+
+    const std::string repeated_text = utf8_bytes("\xE5\xBF\x83\xE3\x81\xAE\xE5\xA3\xB0");
+    for (int index = 0; index < 10; ++index) {
+        const auto file_path = workspace_path / ("other-" + std::to_string(index) + ".txt");
+        std::ofstream output(file_path, std::ios::binary);
+        output << white_circle << "0001T" << white_circle << repeated_text << "\n"
+               << black_circle << "0001T" << black_circle << repeated_text << "\n";
+    }
+
+    const auto current_file_path = workspace_path / "current.txt";
+    const std::string current_uri = bridge_documents::file_uri_from_path(current_file_path);
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + repeated_text + "\n"
+            + black_circle + "0001T" + black_circle + repeated_text + "\n",
+        1);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const json parser_payload = json{
+        {"originalPrefixRegex", config.original_prefix_regex},
+        {"translatedPrefixRegex", config.translated_prefix_regex},
+        {"otherPrefixRegex", config.other_prefix_regex},
+        {"originalWhiteRegex", config.original_white_regex},
+        {"translatedWhiteRegex", config.translated_white_regex},
+        {"originalSuffixRegex", config.original_suffix_regex},
+        {"translatedSuffixRegex", config.translated_suffix_regex},
+    };
+
+    service.update_parser_config(
+        parser_payload,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].empty());
+
+    std::filesystem::remove_all(workspace_path);
+}
+
 DEFINE_TEST(test_standard_text_parser_extracts_japanese_pairs) {
     const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
     const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
@@ -1275,6 +1623,35 @@ DEFINE_TEST(test_standard_text_parser_adjusts_quote_boundaries_for_japanese_line
     assert(pairs[0].original.suffix == u"\u300F");
     assert(pairs[0].translated.white == u"\u201C");
     assert(pairs[0].translated.text == u"\u662F\u5417");
+    assert(pairs[0].translated.suffix == u"\u201D");
+}
+
+DEFINE_TEST(test_standard_text_parser_preserves_multibyte_quote_regex_groups) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "[「]?",
+        "[“]?",
+        "[」]?",
+        "[”]?",
+    };
+    const bridge_text::StandardTextParser parser(config);
+
+    const std::u16string text =
+        u"\u25CB00027147T\u25CB\u300C\u3048\uFF1F\u3000\u3042\u3001\u3044\u3084\u3063\u300D\n"
+        u"\u25CF00027147T\u25CF\u201C\u54C7\uFF1F\u3000\u554A\u3001\u4E0D\u662F\u201D\n";
+
+    const auto pairs = parser.parse_paired_lines(text);
+
+    assert(pairs.size() == 1);
+    assert(pairs[0].original.white == u"\u300C");
+    assert(pairs[0].original.text == u"\u3048\uFF1F\u3000\u3042\u3001\u3044\u3084\u3063");
+    assert(pairs[0].original.suffix == u"\u300D");
+    assert(pairs[0].translated.white == u"\u201C");
+    assert(pairs[0].translated.text == u"\u54C7\uFF1F\u3000\u554A\u3001\u4E0D\u662F");
     assert(pairs[0].translated.suffix == u"\u201D");
 }
 

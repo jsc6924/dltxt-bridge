@@ -592,7 +592,7 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
                     text_document.value("version", 0));
             }
         }
-        lsp::log_local_notification(method, params);
+        // lsp::log_local_notification(method, params);
         return {};
     }
 
@@ -717,23 +717,6 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
                     uri.c_str(),
                     context->document_manager->open_document_count());
                 return RequestResult::error_response(request["id"], -32602, "Document not found for URI: " + uri);
-            }
-        }
-
-        return RequestResult::local_response(
-            jsonrpc::create_response(request["id"], std::move(contents))
-        );
-    }
-
-    if (method == "dltxt/opened_documents") {
-        if (!request.contains("id")) {
-            return {};
-        }
-
-        json contents = json::object();
-        if (context != nullptr && context->document_manager) {
-            for (const auto& [uri, content] : context->document_manager->opened_document_contents_utf8_by_uri()) {
-                contents[uri] = content;
             }
         }
 

@@ -91,12 +91,72 @@ inline RegexConfig regex_config_from_response(const json& response) {
 }
 
 class StandardTextParser {
-    std::regex original_line_regex_;
-    std::regex translated_line_regex_;
+    std::wregex original_line_regex_;
+    std::wregex translated_line_regex_;
 
-    static std::regex build_line_regex(const std::string& prefix, const std::string& white, const std::string& suffix) {
-        return std::regex(
-            "^(" + prefix + ")(" + white + ")(.*?)(" + suffix + ")$",
+    static std::wstring wstring_from_u16(std::u16string_view text) {
+        std::wstring result;
+        result.reserve(text.size());
+
+        if constexpr (sizeof(wchar_t) == sizeof(char16_t)) {
+            for (const char16_t ch : text) {
+                result.push_back(static_cast<wchar_t>(ch));
+            }
+            return result;
+        }
+
+        for (std::size_t index = 0; index < text.size(); ++index) {
+            const char16_t ch = text[index];
+            if (ch >= 0xD800 && ch <= 0xDBFF && index + 1 < text.size()) {
+                const char16_t low = text[index + 1];
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    const std::uint32_t codepoint =
+                        0x10000u + ((static_cast<std::uint32_t>(ch) - 0xD800u) << 10u)
+                        + (static_cast<std::uint32_t>(low) - 0xDC00u);
+                    result.push_back(static_cast<wchar_t>(codepoint));
+                    ++index;
+                    continue;
+                }
+            }
+            result.push_back(static_cast<wchar_t>(ch));
+        }
+
+        return result;
+    }
+
+    static std::u16string u16_from_wstring(std::wstring_view text) {
+        std::u16string result;
+        result.reserve(text.size());
+
+        if constexpr (sizeof(wchar_t) == sizeof(char16_t)) {
+            for (const wchar_t ch : text) {
+                result.push_back(static_cast<char16_t>(ch));
+            }
+            return result;
+        }
+
+        for (const wchar_t ch : text) {
+            const std::uint32_t codepoint = static_cast<std::uint32_t>(ch);
+            if (codepoint <= 0xFFFFu) {
+                result.push_back(static_cast<char16_t>(codepoint));
+                continue;
+            }
+
+            const std::uint32_t value = codepoint - 0x10000u;
+            result.push_back(static_cast<char16_t>(0xD800u + (value >> 10u)));
+            result.push_back(static_cast<char16_t>(0xDC00u + (value & 0x3FFu)));
+        }
+
+        return result;
+    }
+
+    static std::wstring wstring_from_utf8(const std::string& text) {
+        return wstring_from_u16(bridge_documents::utf8_to_utf16(text));
+    }
+
+    static std::wregex build_line_regex(const std::string& prefix, const std::string& white, const std::string& suffix) {
+        return std::wregex(
+            wstring_from_utf8("^(" + prefix + ")(" + white + ")(.*?)(" + suffix + ")$"),
             std::regex::ECMAScript);
     }
 
@@ -111,18 +171,18 @@ class StandardTextParser {
         return text;
     }
 
-    static std::optional<MatchedGroups> match_line(const std::u16string& line, const std::regex& regex) {
-        const std::string utf8_line = bridge_documents::utf16_to_utf8(line);
-        std::smatch match;
-        if (!std::regex_match(utf8_line, match, regex) || match.size() != 5) {
+    static std::optional<MatchedGroups> match_line(const std::u16string& line, const std::wregex& regex) {
+        const std::wstring wide_line = wstring_from_u16(line);
+        std::wsmatch match;
+        if (!std::regex_match(wide_line, match, regex) || match.size() != 5) {
             return std::nullopt;
         }
 
         return MatchedGroups{
-            bridge_documents::utf8_to_utf16(match[1].str()),
-            bridge_documents::utf8_to_utf16(match[2].str()),
-            bridge_documents::utf8_to_utf16(match[3].str()),
-            bridge_documents::utf8_to_utf16(match[4].str()),
+            u16_from_wstring(match[1].str()),
+            u16_from_wstring(match[2].str()),
+            u16_from_wstring(match[3].str()),
+            u16_from_wstring(match[4].str()),
         };
     }
 

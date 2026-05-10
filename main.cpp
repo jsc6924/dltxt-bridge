@@ -4,6 +4,7 @@
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/ssl.hpp>
 #include "bridge_app.hpp"
+#include "bridge_crossref.hpp"
 #include "bridge_documents.hpp"
 #include "bridge_http_proxy.hpp"
 #include "bridge_local_requests.hpp"
@@ -21,8 +22,19 @@ namespace beast = boost::beast;
 namespace websocket = beast::websocket;
 namespace ssl = net::ssl;
 using RemoteRegistry = ActiveRemote<class RemoteClient>;
-net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message);
+net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message, bool should_log = true);
 net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& session, const json& id, int code, const std::string& message);
+void notify_crossref_index_ready(std::weak_ptr<LocalSession> session);
+
+template <typename Fn>
+net::awaitable<json> run_json_task_on_pool(boost::asio::thread_pool& pool, Fn&& fn) {
+    co_return co_await net::co_spawn(
+        pool,
+        [fn = std::forward<Fn>(fn)]() mutable -> net::awaitable<json> {
+            co_return fn();
+        },
+        net::use_awaitable);
+}
 
 void configure_stdio_for_immediate_flush() {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -142,7 +154,8 @@ net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session, std::
                 jsonrpc::create_notification(
                     "dltxt/notification",
                     json{{"message", "heartbeat"}, {"remote_available", remote_registry->is_active()}}
-                )
+                ),
+                false
             );
         }
     } catch (const std::exception& e) {
@@ -150,15 +163,58 @@ net::awaitable<void> heartbeat_loop(std::shared_ptr<LocalSession> session, std::
     }
 }
 
-net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message) {
-    fprintf(stderr, "write_json_message begin: %s\n", message.dump().c_str());
+net::awaitable<void> write_json_message(const std::shared_ptr<LocalSession>& session, const json& message, bool should_log) {
+    if (should_log) {
+        fprintf(stderr, "write_json_message begin: %s\n", message.dump().c_str());
+    }
     std::string framed = lsp::frame_message(message.dump());
     co_await session->write_framed(std::move(framed));
-    fprintf(stderr, "write_json_message end\n");
+    if (should_log) {
+        fprintf(stderr, "write_json_message end\n");
+    }
 }
 
 net::awaitable<void> write_json_error(const std::shared_ptr<LocalSession>& session, const json& id, int code, const std::string& message) {
     co_await write_json_message(session, jsonrpc::create_error(id, code, message));
+}
+
+void schedule_crossref_index_ready_notification(const std::shared_ptr<LocalSession>& session) {
+    net::co_spawn(
+        session->get_executor(),
+        [session]() -> net::awaitable<void> {
+            if (!session->is_open()) {
+                co_return;
+            }
+
+            try {
+                fprintf(stderr, "[debug] notify_crossref_index_ready: sending notification\n");
+                co_await write_json_message(
+                    session,
+                    jsonrpc::create_notification("dltxt/crossref_index_ready", json::object()));
+                fprintf(stderr, "[debug] notify_crossref_index_ready: notification sent\n");
+            } catch (const std::exception& e) {
+                fprintf(stderr, "Failed to notify crossref index ready: %s\n", e.what());
+            } catch (...) {
+                fprintf(stderr, "Failed to notify crossref index ready: unknown exception\n");
+            }
+        },
+        net::detached);
+}
+
+void notify_crossref_index_ready(std::weak_ptr<LocalSession> weak_session) {
+    fprintf(stderr, "[debug] notify_crossref_index_ready called\n");
+    auto session = weak_session.lock();
+    if (!session || !session->is_open()) {
+        fprintf(stderr, "[debug] notify_crossref_index_ready: session not available or not open\n");
+        return;
+    }
+
+    if (!session->request_crossref_index_ready_delivery()) {
+        fprintf(stderr, "[debug] notify_crossref_index_ready: deferring until client initialized\n");
+        return;
+    }
+
+    schedule_crossref_index_ready_notification(session);
 }
 
 class LocalInputQueue {
@@ -286,6 +342,7 @@ net::awaitable<void> handle_local_session(
     std::shared_ptr<ResponseManager> remote_response_manager,
     std::shared_ptr<ResponseManager> local_response_manager,
     std::shared_ptr<bridge_documents::DocumentManager> document_manager,
+    std::shared_ptr<bridge_crossref::CrossrefService> crossref_service,
     std::chrono::milliseconds request_timeout) {
     fprintf(stderr, "Accepted local stdio session\n");
     
@@ -361,6 +418,97 @@ net::awaitable<void> handle_local_session(
 
                 fprintf(stderr, "JSON-RPC Request: %s\n", request.dump().c_str());
                 method = request["method"].get<std::string>();
+                const json params = request.value("params", json::object());
+
+                if (method == "dltxt/set_parser_regex") {
+                    fprintf(stderr, "[debug] handling set_parser_regex method\n");
+                    if (!params.contains("parserRegex")) {
+                        if (request.contains("id")) {
+                            co_await write_json_error(session, request["id"], -32602, "Invalid params: missing 'parserRegex' field");
+                        }
+                        continue;
+                    }
+
+                    if (params["parserRegex"].is_null()) {
+                        if (request.contains("id")) {
+                            co_await write_json_message(session, jsonrpc::create_response(request["id"], json(nullptr)));
+                        }
+                        continue;
+                    } else if (params["parserRegex"].is_object()) {
+                        crossref_service->update_parser_config(
+                            params["parserRegex"],
+                            document_manager->workspace_folders_snapshot(),
+                            document_manager->open_documents_snapshot(),
+                            bridge_runtime::shared_thread_pool());
+                    } else {
+                        if (request.contains("id")) {
+                            co_await write_json_error(session, request["id"], -32602, "Invalid params: 'parserRegex' must be an object or null");
+                        }
+                        continue;
+                    }
+
+                    if (request.contains("id")) {
+                        co_await write_json_message(session, jsonrpc::create_response(request["id"], json(nullptr)));
+                    }
+                    continue;
+                }
+
+                if (method == "dltxt/get_similar_text") {
+                    if (!request.contains("id")) {
+                        continue;
+                    }
+
+                    if (!params.contains("uri") || !params["uri"].is_string()) {
+                        co_await write_json_error(session, request["id"], -32602, "Invalid params: missing or invalid 'uri' field");
+                        continue;
+                    }
+
+                    const std::string uri = params["uri"].get<std::string>();
+                    const int threshold = params.value("threshold", 80);
+                    const std::size_t limit = params.value("limit", std::size_t{10});
+                    fprintf(stderr,
+                        "similar_text: request id=%s uri=%s threshold=%d limit=%zu\n",
+                        request["id"].dump().c_str(),
+                        uri.c_str(),
+                        threshold,
+                        limit);
+
+                    std::optional<bridge_documents::TextDocument> current_document = document_manager->document_snapshot(uri);
+                    if (!current_document.has_value()) {
+                        bool loaded = false;
+                        try {
+                            current_document = bridge_batch::load_document_fast_from_uri(uri);
+                            loaded = true;
+                            fprintf(stderr, "similar_text: loaded current document from disk uri=%s\n", uri.c_str());
+                        } catch (...) {
+                            fprintf(stderr, "similar_text: failed to load current document from disk uri=%s\n", uri.c_str());
+                        }
+
+                        if (!loaded) {
+                            fprintf(stderr, "similar_text: returning empty result because current document is unavailable uri=%s\n", uri.c_str());
+                            co_await write_json_message(session, jsonrpc::create_response(request["id"], json{{"matches", json::array()}}));
+                            continue;
+                        }
+                    } else {
+                        fprintf(stderr, "similar_text: using snapshotted open document uri=%s version=%d\n", uri.c_str(), current_document->getVersion());
+                    }
+
+                    fprintf(stderr, "similar_text: dispatching search task uri=%s\n", uri.c_str());
+                    const json result = co_await run_json_task_on_pool(
+                        bridge_runtime::shared_thread_pool(),
+                        [crossref_service, current_document = std::move(*current_document), threshold, limit]() mutable {
+                            return crossref_service->search_json(current_document, threshold, limit);
+                        });
+
+                    fprintf(stderr,
+                        "similar_text: search task finished uri=%s match_groups=%zu\n",
+                        uri.c_str(),
+                        result.contains("matches") && result["matches"].is_array() ? result["matches"].size() : std::size_t{0});
+
+                    co_await write_json_message(session, jsonrpc::create_response(request["id"], result));
+                    fprintf(stderr, "similar_text: response written id=%s uri=%s\n", request["id"].dump().c_str(), uri.c_str());
+                    continue;
+                }
 
                 bridge_local::RequestContext request_context{document_manager};
                 auto local_handling = bridge_local::handle_request(session, request, &request_context);
@@ -371,6 +519,25 @@ net::awaitable<void> handle_local_session(
                     local_handling.response.has_value() ? 1 : 0,
                     static_cast<int>(local_handling.directive));
                 if (!local_handling.forward_to_remote) {
+                    if (method == "initialized" && session->mark_client_initialized()) {
+                        fprintf(stderr, "[debug] handle_local_session: flushing deferred crossref index ready notification\n");
+                        schedule_crossref_index_ready_notification(session);
+                    }
+
+                    if (method == "initialize" || method == "workspace/didChangeWorkspaceFolders") {
+                        // pass
+                    } else if (method == "textDocument/didOpen" || method == "textDocument/didChange" || method == "textDocument/didSave") {
+                        const std::string uri = bridge_local::text_document_uri_from_params(params);
+                        auto snapshot = document_manager->document_snapshot(uri);
+                        if (snapshot.has_value()) {
+                            crossref_service->schedule_open_document_update(std::move(*snapshot), bridge_runtime::shared_thread_pool());
+                        }
+                    } else if (method == "textDocument/didClose") {
+                        crossref_service->schedule_closed_document_refresh(
+                            bridge_local::text_document_uri_from_params(params),
+                            bridge_runtime::shared_thread_pool());
+                    }
+
                     if (local_handling.response.has_value()) {
                         fprintf(stderr,
                             "handle_local_session: writing local response for method=%s id=%s\n",
@@ -578,16 +745,20 @@ int main(int argc, char* argv[]) {
         auto remote_response_manager = std::make_shared<ResponseManager>();
         auto local_response_manager = std::make_shared<ResponseManager>();
         auto document_manager = std::make_shared<bridge_documents::DocumentManager>();
+        auto crossref_service = std::make_shared<bridge_crossref::CrossrefService>();
         auto http_proxy_service = std::make_shared<bridge_http::MojiProxyService>(ioc.get_executor(), dltxt_bridge::version);
         auto local_input = open_stdio_input_handle();
         auto local_input_queue = std::make_shared<LocalInputQueue>(ioc.get_executor());
         auto local_session = session_manager->register_session(std::make_shared<LocalSession>(ioc.get_executor(), open_stdio_output_handle()));
+        crossref_service->set_index_ready_notifier([weak_session = std::weak_ptr<LocalSession>(local_session)]() {
+            notify_crossref_index_ready(weak_session);
+        });
         start_stdio_reader_thread(ioc.get_executor(), local_input, local_input_queue);
 
         // Launch ONE coordinator coroutine to handle startup order
-        net::co_spawn(ioc, [remote_registry, session_manager, remote_response_manager, local_response_manager, document_manager, local_input_queue, local_session, settings]() mutable -> net::awaitable<void> {
+        net::co_spawn(ioc, [remote_registry, session_manager, remote_response_manager, local_response_manager, document_manager, crossref_service, local_input_queue, local_session, settings]() mutable -> net::awaitable<void> {
             auto ex = co_await net::this_coro::executor;
-            net::co_spawn(ex, handle_local_session(local_input_queue, local_session, remote_registry, session_manager, remote_response_manager, local_response_manager, document_manager, settings.request_timeout), net::detached);
+            net::co_spawn(ex, handle_local_session(local_input_queue, local_session, remote_registry, session_manager, remote_response_manager, local_response_manager, document_manager, crossref_service, settings.request_timeout), net::detached);
 
             co_await run_remote_retry_loop(
                 remote_registry,

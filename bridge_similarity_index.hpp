@@ -1,10 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -26,6 +29,7 @@ struct SearchResult {
 class SimilarityIndex {
     using Term = std::u16string;
     using TermFrequencyMap = std::unordered_map<Term, std::uint32_t>;
+    static constexpr std::size_t kMaxCandidateBudget = 1024;
 
     struct IndexedLine {
         LineId line_id = 0;
@@ -44,7 +48,7 @@ class SimilarityIndex {
     static TermFrequencyMap build_term_frequency(std::u16string_view text) {
         TermFrequencyMap frequencies;
 
-        for (std::size_t gram_size : {std::size_t{2}, std::size_t{3}}) {
+        for (std::size_t gram_size : {std::size_t{2}}) {
             if (text.size() < gram_size) {
                 continue;
             }
@@ -94,6 +98,18 @@ class SimilarityIndex {
             norm_squared += weight * weight;
         }
         return std::sqrt(norm_squared);
+    }
+
+    static void insert_candidates_up_to_budget(
+        std::unordered_set<LineId>& candidate_ids,
+        const std::unordered_set<LineId>& posting,
+        std::size_t candidate_budget) {
+        for (LineId candidate_id : posting) {
+            candidate_ids.insert(candidate_id);
+            if (candidate_ids.size() >= candidate_budget) {
+                break;
+            }
+        }
     }
 
 public:
@@ -148,18 +164,28 @@ public:
         std::u16string_view query,
         double min_score = 0.0,
         std::size_t max_results = 10) const {
+        using Clock = std::chrono::steady_clock;
+        const auto search_started_at = Clock::now();
         if (lines_.empty() || max_results == 0) {
             return {};
         }
 
         const TermFrequencyMap query_term_frequency = build_term_frequency(query);
+        const auto term_frequency_built_at = Clock::now();
         if (query_term_frequency.empty()) {
             return {};
         }
 
+        struct WeightedQueryTerm {
+            const Term* term = nullptr;
+            double query_weight = 0.0;
+            std::size_t posting_size = 0;
+        };
+
         std::unordered_map<Term, double> query_weights;
         query_weights.reserve(query_term_frequency.size());
-        std::unordered_set<LineId> candidate_ids;
+        std::vector<WeightedQueryTerm> weighted_terms;
+        weighted_terms.reserve(query_term_frequency.size());
         double query_norm_squared = 0.0;
 
         for (const auto& [term, count] : query_term_frequency) {
@@ -169,13 +195,60 @@ public:
 
             const auto posting_it = postings_.find(term);
             if (posting_it != postings_.end()) {
-                candidate_ids.insert(posting_it->second.begin(), posting_it->second.end());
+                weighted_terms.push_back(WeightedQueryTerm{
+                    &term,
+                    weight,
+                    posting_it->second.size(),
+                });
             }
         }
 
-        if (candidate_ids.empty() || query_norm_squared <= 0.0) {
+        if (weighted_terms.empty() || query_norm_squared <= 0.0) {
             return {};
         }
+
+        std::sort(weighted_terms.begin(), weighted_terms.end(), [](const WeightedQueryTerm& left, const WeightedQueryTerm& right) {
+            if (left.posting_size != right.posting_size) {
+                return left.posting_size < right.posting_size;
+            }
+            return left.query_weight > right.query_weight;
+        });
+
+        const std::size_t candidate_budget = (std::min)((std::max)(max_results * 24, std::size_t{128}), kMaxCandidateBudget);
+        const std::size_t common_posting_cutoff = (std::max)(candidate_budget * 4, std::size_t{512});
+        std::unordered_set<LineId> candidate_ids;
+        candidate_ids.reserve(candidate_budget);
+
+        for (const auto& weighted_term : weighted_terms) {
+            if (weighted_term.posting_size > common_posting_cutoff && !candidate_ids.empty()) {
+                continue;
+            }
+
+            const auto posting_it = postings_.find(*weighted_term.term);
+            if (posting_it == postings_.end()) {
+                continue;
+            }
+
+            insert_candidates_up_to_budget(candidate_ids, posting_it->second, candidate_budget);
+            if (candidate_ids.size() >= candidate_budget) {
+                break;
+            }
+        }
+
+        if (candidate_ids.empty()) {
+            const auto posting_it = postings_.find(*weighted_terms.front().term);
+            if (posting_it == postings_.end()) {
+                return {};
+            }
+
+            insert_candidates_up_to_budget(candidate_ids, posting_it->second, candidate_budget);
+        }
+
+        if (candidate_ids.empty()) {
+            return {};
+        }
+
+        const auto candidates_built_at = Clock::now();
 
         const double query_norm = std::sqrt(query_norm_squared);
         std::vector<SearchResult> results;
@@ -220,6 +293,8 @@ public:
             });
         }
 
+        const auto scoring_finished_at = Clock::now();
+
         std::sort(results.begin(), results.end(), [](const SearchResult& left, const SearchResult& right) {
             if (left.score != right.score) {
                 return left.score > right.score;
@@ -236,6 +311,24 @@ public:
         if (results.size() > max_results) {
             results.resize(max_results);
         }
+
+        const auto search_finished_at = Clock::now();
+        const auto to_milliseconds = [](Clock::duration duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        fprintf(
+            stderr,
+            "similarity_index: search query_len=%zu query_terms=%zu weighted_terms=%zu candidates=%zu results=%zu tf_ms=%.3f candidate_ms=%.3f score_ms=%.3f sort_ms=%.3f total_ms=%.3f\n",
+            query.size(),
+            query_term_frequency.size(),
+            weighted_terms.size(),
+            candidate_ids.size(),
+            results.size(),
+            to_milliseconds(term_frequency_built_at - search_started_at),
+            to_milliseconds(candidates_built_at - term_frequency_built_at),
+            to_milliseconds(scoring_finished_at - candidates_built_at),
+            to_milliseconds(search_finished_at - scoring_finished_at),
+            to_milliseconds(search_finished_at - search_started_at));
 
         return results;
     }

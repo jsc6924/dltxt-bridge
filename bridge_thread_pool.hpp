@@ -15,13 +15,13 @@ class SharedThreadPool {
     std::unique_ptr<boost::asio::thread_pool> pool_;
 
 public:
-    void initialize(std::size_t thread_count = std::max<std::size_t>(1, std::thread::hardware_concurrency())) {
+    void initialize(std::size_t thread_count = std::max<std::size_t>(2, std::thread::hardware_concurrency())) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (pool_) {
             return;
         }
 
-        pool_ = std::make_unique<boost::asio::thread_pool>(std::max<std::size_t>(1, thread_count));
+        pool_ = std::make_unique<boost::asio::thread_pool>(std::max<std::size_t>(2, thread_count));
     }
 
     boost::asio::thread_pool& get() {
@@ -58,7 +58,7 @@ inline SharedThreadPool& shared_thread_pool_state() {
     return state;
 }
 
-inline void initialize_shared_thread_pool(std::size_t thread_count = std::max<std::size_t>(1, std::thread::hardware_concurrency())) {
+inline void initialize_shared_thread_pool(std::size_t thread_count = std::max<std::size_t>(2, std::thread::hardware_concurrency())) {
     shared_thread_pool_state().initialize(thread_count);
 }
 
