@@ -906,6 +906,27 @@ DEFINE_TEST(test_utf_conversions_preserve_japanese_quotes_and_markers) {
     assert(round_tripped == original);
 }
 
+DEFINE_TEST(test_file_uri_round_trips_japanese_filename_on_windows_safe_paths) {
+    const auto workspace_path = std::filesystem::temp_directory_path() / u8"dltxt_bridge_\u65E5\u672C\u8A9E";
+    std::filesystem::create_directories(workspace_path);
+    const auto file_path = workspace_path / u8"\u674F\u73E0\u221A209_11\u6708_02.ks.json.txt";
+    {
+        std::ofstream output(file_path, std::ios::binary);
+        output << "jp-path";
+    }
+
+    const std::string uri = bridge_documents::file_uri_from_path(file_path);
+    const std::filesystem::path round_tripped = bridge_documents::file_path_from_uri(uri);
+    const auto document = bridge_batch::load_document_fast_from_uri(uri);
+
+    assert(round_tripped == file_path);
+    assert(document.getFilePath() == file_path);
+    assert(bridge_documents::utf16_to_utf8(document.getContent()) == "jp-path");
+
+    std::filesystem::remove(file_path);
+    std::filesystem::remove(workspace_path);
+}
+
 DEFINE_TEST(test_local_handler_tracks_document_lifecycle_notifications) {
     auto manager = std::make_shared<bridge_documents::DocumentManager>();
     bridge_local::RequestContext context{manager};
@@ -1298,17 +1319,9 @@ DEFINE_TEST(test_crossref_service_returns_bridge_matches_for_open_documents) {
 
     bridge_crossref::CrossrefService service;
     boost::asio::thread_pool pool(2);
-    const json parser_payload = json{
-        {"originalPrefixRegex", config.original_prefix_regex},
-        {"translatedPrefixRegex", config.translated_prefix_regex},
-        {"otherPrefixRegex", config.other_prefix_regex},
-        {"originalWhiteRegex", config.original_white_regex},
-        {"translatedWhiteRegex", config.translated_white_regex},
-        {"originalSuffixRegex", config.original_suffix_regex},
-        {"translatedSuffixRegex", config.translated_suffix_regex},
-    };
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-open-docs"};
     service.update_parser_config(
-        parser_payload,
+        parser_state,
         manager.workspace_folders_snapshot(),
         manager.open_documents_snapshot(),
         pool);
@@ -1364,18 +1377,10 @@ DEFINE_TEST(test_crossref_service_preserves_japanese_quotes_in_json_results) {
 
     bridge_crossref::CrossrefService service;
     boost::asio::thread_pool pool(2);
-    const json parser_payload = json{
-        {"originalPrefixRegex", config.original_prefix_regex},
-        {"translatedPrefixRegex", config.translated_prefix_regex},
-        {"otherPrefixRegex", config.other_prefix_regex},
-        {"originalWhiteRegex", config.original_white_regex},
-        {"translatedWhiteRegex", config.translated_white_regex},
-        {"originalSuffixRegex", config.original_suffix_regex},
-        {"translatedSuffixRegex", config.translated_suffix_regex},
-    };
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-preserve-quotes"};
 
     service.update_parser_config(
-        parser_payload,
+        parser_state,
         manager.workspace_folders_snapshot(),
         manager.open_documents_snapshot(),
         pool);
@@ -1439,18 +1444,10 @@ DEFINE_TEST(test_crossref_service_preserves_japanese_quotes_in_disk_loaded_json_
 
     bridge_crossref::CrossrefService service;
     boost::asio::thread_pool pool(2);
-    const json parser_payload = json{
-        {"originalPrefixRegex", config.original_prefix_regex},
-        {"translatedPrefixRegex", config.translated_prefix_regex},
-        {"otherPrefixRegex", config.other_prefix_regex},
-        {"originalWhiteRegex", config.original_white_regex},
-        {"translatedWhiteRegex", config.translated_white_regex},
-        {"originalSuffixRegex", config.original_suffix_regex},
-        {"translatedSuffixRegex", config.translated_suffix_regex},
-    };
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-preserve-quotes-disk"};
 
     service.update_parser_config(
-        parser_payload,
+        parser_state,
         manager.workspace_folders_snapshot(),
         manager.open_documents_snapshot(),
         pool);
@@ -1537,18 +1534,10 @@ DEFINE_TEST(test_crossref_service_skips_lines_when_exact_count_reaches_limit) {
 
     bridge_crossref::CrossrefService service;
     boost::asio::thread_pool pool(2);
-    const json parser_payload = json{
-        {"originalPrefixRegex", config.original_prefix_regex},
-        {"translatedPrefixRegex", config.translated_prefix_regex},
-        {"otherPrefixRegex", config.other_prefix_regex},
-        {"originalWhiteRegex", config.original_white_regex},
-        {"translatedWhiteRegex", config.translated_white_regex},
-        {"originalSuffixRegex", config.original_suffix_regex},
-        {"translatedSuffixRegex", config.translated_suffix_regex},
-    };
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-exact-limit"};
 
     service.update_parser_config(
-        parser_payload,
+        parser_state,
         manager.workspace_folders_snapshot(),
         manager.open_documents_snapshot(),
         pool);
@@ -1655,7 +1644,7 @@ DEFINE_TEST(test_standard_text_parser_preserves_multibyte_quote_regex_groups) {
     assert(pairs[0].translated.suffix == u"\u201D");
 }
 
-DEFINE_TEST(test_standard_text_parser_throws_on_dangling_original_line) {
+DEFINE_TEST(test_standard_text_parser_skips_dangling_original_line_without_throwing) {
     const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
     const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
     const bridge_text::RegexConfig config{
@@ -1669,14 +1658,14 @@ DEFINE_TEST(test_standard_text_parser_throws_on_dangling_original_line) {
     };
     const bridge_text::StandardTextParser parser(config);
 
-    bool threw = false;
-    try {
-        (void)parser.parse_paired_lines(u"\u25CB00027145T\u25CB\u3053\u3093\u306B\u3061\u306F\u3002\n");
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
+    const auto pairs = parser.parse_paired_lines(
+        u"\u25CB00027145T\u25CB\u3053\u3093\u306B\u3061\u306F\u3002\n"
+        u"\u25CF00027145T\u25CF\u4F60\u597D\u3002\n"
+        u"\u25CB00027146T\u25CB\u3055\u3088\u3046\u306A\u3089\u3002\n");
 
-    assert(threw);
+    assert(pairs.size() == 1);
+    assert(pairs[0].original.text == u"\u3053\u3093\u306B\u3061\u306F\u3002");
+    assert(pairs[0].translated.text == u"\u4F60\u597D\u3002");
 }
 
 DEFINE_TEST(test_text_document_edit_splits_single_line_when_patch_contains_newline) {
@@ -2125,6 +2114,35 @@ DEFINE_TEST(test_standard_text_parser_builds_from_runtime_regex_request) {
     assert(pairs->size() == 1);
     assert((*pairs)[0].original.text == u"\u3053\u3093\u306B\u3061\u306F");
     assert((*pairs)[0].translated.text == u"\u4F60\u597D");
+}
+
+DEFINE_TEST(test_standard_text_parser_parses_regex_with_extra_user_captures) {
+    const std::string white_star = utf8_bytes("\xE2\x98\x86");
+    const std::string black_star = utf8_bytes("\xE2\x98\x85");
+    const std::string left_quote = utf8_bytes("\xE3\x80\x8C");
+    const std::string right_quote = utf8_bytes("\xE3\x80\x8D");
+    const std::string jp_hello = utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF");
+    const std::string zh_hello = utf8_bytes("\xE4\xBD\xA0\xE5\xA5\xBD");
+
+    const bridge_text::RegexConfig config{
+        white_star + "[A-Za-z0-9]+" + white_star + "(%n;)?",
+        black_star + "[A-Za-z0-9]+" + black_star + "(%n;)?",
+        "",
+        "\\s*(" + left_quote + ")?",
+        "\\s*(" + left_quote + ")?",
+        "(" + right_quote + ")?",
+        "(" + right_quote + ")?",
+    };
+    const bridge_text::StandardTextParser parser(config);
+
+    const auto pairs = parser.parse_paired_lines(
+        bridge_documents::utf8_to_utf16(
+            white_star + "A001" + white_star + left_quote + jp_hello + right_quote + "\n"
+                + black_star + "A001" + black_star + left_quote + zh_hello + right_quote + "\n"));
+
+    assert(pairs.size() == 1);
+    assert(bridge_documents::utf16_to_utf8(pairs[0].original.text) == jp_hello);
+    assert(bridge_documents::utf16_to_utf8(pairs[0].translated.text) == zh_hello);
 }
 
 struct FakeRemote {

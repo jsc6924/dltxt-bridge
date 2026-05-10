@@ -34,6 +34,9 @@
 
 namespace bridge_documents {
 
+inline std::u16string utf8_to_utf16(std::string_view utf8_text);
+inline std::string utf16_to_utf8(std::u16string_view utf16_text);
+
 struct Position {
     std::size_t line = 0;
     std::size_t character = 0;
@@ -83,10 +86,37 @@ inline std::string percent_decode(std::string_view text) {
     return decoded;
 }
 
+inline std::string percent_encode(std::string_view text) {
+    std::string encoded;
+    encoded.reserve(text.size() * 3U);
+
+    constexpr char hex_digits[] = "0123456789ABCDEF";
+
+    for (unsigned char ch : text) {
+        const bool is_unreserved = std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~';
+        const bool is_path_separator = ch == '/' || ch == ':';
+        if (is_unreserved || is_path_separator) {
+            encoded.push_back(static_cast<char>(ch));
+            continue;
+        }
+
+        encoded.push_back('%');
+        encoded.push_back(hex_digits[(ch >> 4) & 0x0F]);
+        encoded.push_back(hex_digits[ch & 0x0F]);
+    }
+
+    return encoded;
+}
+
 inline std::filesystem::path file_path_from_uri(std::string_view uri) {
     constexpr std::string_view prefix = "file://";
     if (uri.rfind(prefix, 0) != 0) {
-        return std::filesystem::path(percent_decode(uri));
+        const std::string decoded = percent_decode(uri);
+#ifdef _WIN32
+        return std::filesystem::path(utf8_to_utf16(decoded));
+#else
+        return std::filesystem::path(decoded);
+#endif
     }
 
     std::string decoded = percent_decode(uri.substr(prefix.size()));
@@ -94,17 +124,26 @@ inline std::filesystem::path file_path_from_uri(std::string_view uri) {
         decoded.erase(decoded.begin());
     }
 
+#ifdef _WIN32
+    return std::filesystem::path(utf8_to_utf16(decoded));
+#else
     return std::filesystem::path(decoded);
+#endif
 }
 
 inline std::string file_uri_from_path(const std::filesystem::path& path) {
-    std::string generic = path.lexically_normal().generic_string();
+    std::string generic;
+#ifdef _WIN32
+    generic = utf16_to_utf8(path.lexically_normal().generic_u16string());
+#else
+    generic = path.lexically_normal().generic_string();
+#endif
 #ifdef _WIN32
     if (generic.size() >= 2 && generic[1] == ':') {
         generic.insert(generic.begin(), '/');
     }
 #endif
-    return "file://" + generic;
+    return "file://" + percent_encode(generic);
 }
 
 inline std::u16string normalize_newlines(std::u16string_view text) {

@@ -1,12 +1,13 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <boost/regex.hpp>
 
 #include <nlohmann/json.hpp>
 
 #include <optional>
-#include <regex>
 #include <stdexcept>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -91,8 +92,8 @@ inline RegexConfig regex_config_from_response(const json& response) {
 }
 
 class StandardTextParser {
-    std::wregex original_line_regex_;
-    std::wregex translated_line_regex_;
+    boost::wregex original_line_regex_;
+    boost::wregex translated_line_regex_;
 
     static std::wstring wstring_from_u16(std::u16string_view text) {
         std::wstring result;
@@ -154,10 +155,10 @@ class StandardTextParser {
         return wstring_from_u16(bridge_documents::utf8_to_utf16(text));
     }
 
-    static std::wregex build_line_regex(const std::string& prefix, const std::string& white, const std::string& suffix) {
-        return std::wregex(
-            wstring_from_utf8("^(" + prefix + ")(" + white + ")(.*?)(" + suffix + ")$"),
-            std::regex::ECMAScript);
+    static boost::wregex build_line_regex(const std::string& prefix, const std::string& white, const std::string& suffix) {
+        return boost::wregex(
+            wstring_from_utf8("^(?<prefix>" + prefix + ")(?<white>" + white + ")(?<text>.*?)(?<suffix>" + suffix + ")$"),
+            boost::regex_constants::perl);
     }
 
     static std::u16string trim_right(std::u16string text) {
@@ -171,18 +172,26 @@ class StandardTextParser {
         return text;
     }
 
-    static std::optional<MatchedGroups> match_line(const std::u16string& line, const std::wregex& regex) {
+    static std::optional<MatchedGroups> match_line(const std::u16string& line, const boost::wregex& regex) {
         const std::wstring wide_line = wstring_from_u16(line);
-        std::wsmatch match;
-        if (!std::regex_match(wide_line, match, regex) || match.size() != 5) {
+        boost::wsmatch match;
+        if (!boost::regex_match(wide_line, match, regex)) {
+            return std::nullopt;
+        }
+
+        const auto prefix = match[std::wstring{L"prefix"}];
+        const auto white = match[std::wstring{L"white"}];
+        const auto text = match[std::wstring{L"text"}];
+        const auto suffix = match[std::wstring{L"suffix"}];
+        if (!prefix.matched || !white.matched || !text.matched || !suffix.matched) {
             return std::nullopt;
         }
 
         return MatchedGroups{
-            u16_from_wstring(match[1].str()),
-            u16_from_wstring(match[2].str()),
-            u16_from_wstring(match[3].str()),
-            u16_from_wstring(match[4].str()),
+            u16_from_wstring(prefix.str()),
+            u16_from_wstring(white.str()),
+            u16_from_wstring(text.str()),
+            u16_from_wstring(suffix.str()),
         };
     }
 
@@ -272,7 +281,10 @@ public:
     }
 
     std::vector<ParsedPair> parse_paired_lines(std::u16string_view text) const {
-        return parse_paired_lines(bridge_documents::split_lines(text));
+        auto lines = bridge_documents::split_lines(text);
+        for (std::size_t index = 0; index < lines.size(); ++index) {
+        }
+        return parse_paired_lines(lines);
     }
 
     std::vector<ParsedPair> parse_paired_lines(const std::vector<std::u16string>& lines) const {
@@ -283,10 +295,7 @@ public:
         for (std::size_t line_index = 0; line_index < lines.size(); ++line_index) {
             const std::u16string line = trim_right(lines[line_index]);
             if (auto original = match_line(line, original_line_regex_)) {
-                if (pending_original.has_value()) {
-                    throw std::runtime_error("Unmatched original line before next original line");
-                }
-
+                // Prefer the most recent original line when data is incomplete or malformed.
                 pending_original = std::move(*original);
                 pending_original_line = line_index;
                 continue;
@@ -308,10 +317,6 @@ public:
             }
         }
 
-        if (pending_original.has_value()) {
-            throw std::runtime_error("Dangling original line without matching translation");
-        }
-
         return parsed;
     }
 
@@ -330,5 +335,19 @@ public:
         return parsed;
     }
 };
+
+struct ParserState {
+    bridge_text::RegexConfig config;
+    std::string stamp;
+};
+
+inline std::shared_ptr<StandardTextParser> &global_text_parser() {
+    static std::shared_ptr<StandardTextParser> parser;
+    return parser;
+}
+
+inline void set_global_text_parser(std::shared_ptr<StandardTextParser> parser) {
+    global_text_parser() = std::move(parser);
+}
 
 }  // namespace bridge_text

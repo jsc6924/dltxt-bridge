@@ -15,7 +15,7 @@ if(MSVC)
 endif()
 
 # Find dependencies via vcpkg
-find_package(Boost REQUIRED COMPONENTS system)
+find_package(Boost REQUIRED COMPONENTS system regex)
 find_package(nlohmann_json CONFIG REQUIRED)
 set(OPENSSL_USE_STATIC_LIBS TRUE)
 find_package(OpenSSL REQUIRED)
@@ -52,6 +52,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 target_link_libraries(dltxt_bridge PRIVATE 
     Boost::headers
     Boost::system
+  Boost::regex
     nlohmann_json::nlohmann_json
     OpenSSL::SSL
     OpenSSL::Crypto
@@ -61,6 +62,7 @@ target_link_libraries(dltxt_bridge PRIVATE
 target_link_libraries(dltxt_bridge_tests PRIVATE 
   Boost::headers
   Boost::system
+  Boost::regex
   nlohmann_json::nlohmann_json
   OpenSSL::SSL
   OpenSSL::Crypto

@@ -20,6 +20,7 @@
 #include <nlohmann/json.hpp>
 #include "local_session.hpp"
 #include "bridge_documents.hpp"
+#include "bridge_text_parser.hpp"
 #include "bridge_version.hpp"
 
 namespace net = boost::asio;
@@ -714,6 +715,65 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
             } else {
                 fprintf(stderr,
                     "dltxt/get_document_content miss uri=%s open_document_count=%zu\n",
+                    uri.c_str(),
+                    context->document_manager->open_document_count());
+                return RequestResult::error_response(request["id"], -32602, "Document not found for URI: " + uri);
+            }
+        }
+
+        return RequestResult::local_response(
+            jsonrpc::create_response(request["id"], std::move(contents))
+        );
+    }
+
+    if (method == "dltxt/get_parsed_document") {
+        if (!request.contains("id")) {
+            return {};
+        }
+
+        if (!params.contains("uri") || !params["uri"].is_string()) {
+            return RequestResult::error_response(request["id"], -32602, "Invalid params: missing or invalid 'uri' field");
+        }
+
+        json contents = json::object();
+        if (context != nullptr && context->document_manager) {
+            const std::string uri = params["uri"].get<std::string>();
+            fprintf(stderr, "dltxt/get_parsed_document lookup uri=%s\n", uri.c_str());
+            const auto content_opt = context->document_manager->document_content_utf8_by_uri(uri);
+            if (content_opt.has_value()) {
+                fprintf(stderr,
+                    "dltxt/get_parsed_document hit uri=%s content_bytes=%zu\n",
+                    uri.c_str(),
+                    content_opt->size());
+                auto parser = bridge_text::global_text_parser();
+                if (!parser) {
+                    fprintf(stderr, "Failed to acquire text parser for dltxt/get_parsed_document\n");
+                    return RequestResult::error_response(request["id"], -32603, "Internal error: unable to acquire text parser");
+                }
+                auto content = *content_opt;
+                fprintf(stderr, "Parsing document content =%s\n", content.c_str());
+                auto res = parser->parse_paired_lines(bridge_documents::utf8_to_utf16(content));
+                json parsed_content = json::array();
+                for (const auto& pair : res) {
+                    parsed_content.push_back(json{
+                        {"originalLineIndex", pair.original_line_index},
+                        {"translatedLineIndex", pair.translated_line_index},
+                        {"original", std::format("[{}][{}][{}][{}]",
+                            bridge_documents::utf16_to_utf8(pair.original.prefix),
+                            bridge_documents::utf16_to_utf8(pair.original.white),
+                            bridge_documents::utf16_to_utf8(pair.original.text),
+                            bridge_documents::utf16_to_utf8(pair.original.suffix))},
+                        {"translated", std::format("[{}][{}][{}][{}]",
+                            bridge_documents::utf16_to_utf8(pair.translated.prefix),
+                            bridge_documents::utf16_to_utf8(pair.translated.white),
+                            bridge_documents::utf16_to_utf8(pair.translated.text),
+                            bridge_documents::utf16_to_utf8(pair.translated.suffix))},
+                    });
+                }
+                contents["content"] = std::move(parsed_content);
+            } else {
+                fprintf(stderr,
+                    "dltxt/get_parsed_document miss uri=%s open_document_count=%zu\n",
                     uri.c_str(),
                     context->document_manager->open_document_count());
                 return RequestResult::error_response(request["id"], -32602, "Document not found for URI: " + uri);

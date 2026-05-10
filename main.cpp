@@ -12,6 +12,7 @@
 #include "bridge_runtime.hpp"
 #include "bridge_thread_pool.hpp"
 #include "bridge_version.hpp"
+#include "bridge_text_parser.hpp"
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -416,9 +417,22 @@ net::awaitable<void> handle_local_session(
                     continue;
                 }
 
-                fprintf(stderr, "JSON-RPC Request: %s\n", request.dump().c_str());
                 method = request["method"].get<std::string>();
                 const json params = request.value("params", json::object());
+
+                if (method == "textDocument/didOpen") {
+                    const json text_document = params.value("textDocument", json::object());
+                    const std::string uri = text_document.value("uri", std::string{});
+                    const std::size_t text_bytes = text_document.contains("text") && text_document["text"].is_string()
+                        ? text_document["text"].get<std::string>().size()
+                        : std::size_t{0};
+                    fprintf(stderr,
+                        "JSON-RPC Request: textDocument/didOpen uri=%s text_bytes=%zu\n",
+                        uri.c_str(),
+                        text_bytes);
+                } else {
+                    fprintf(stderr, "JSON-RPC Request: %s\n", request.dump().c_str());
+                }
 
                 if (method == "dltxt/set_parser_regex") {
                     fprintf(stderr, "[debug] handling set_parser_regex method\n");
@@ -435,8 +449,13 @@ net::awaitable<void> handle_local_session(
                         }
                         continue;
                     } else if (params["parserRegex"].is_object()) {
+                        bridge_text::ParserState parser_state{
+                            bridge_text::regex_config_from_json(params["parserRegex"]),
+                            params["parserRegex"].dump(),
+                        };
+                        bridge_text::set_global_text_parser(std::make_shared<bridge_text::StandardTextParser>(parser_state.config));
                         crossref_service->update_parser_config(
-                            params["parserRegex"],
+                            parser_state,
                             document_manager->workspace_folders_snapshot(),
                             document_manager->open_documents_snapshot(),
                             bridge_runtime::shared_thread_pool());
