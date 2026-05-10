@@ -9,6 +9,7 @@
 #include "bridge_local_requests.hpp"
 #include "bridge_protocol.hpp"
 #include "bridge_runtime.hpp"
+#include "bridge_thread_pool.hpp"
 #include "bridge_version.hpp"
 #include <cstdio>
 #include <exception>
@@ -561,6 +562,13 @@ int main(int argc, char* argv[]) {
             printf("dltxt_bridge_v3 %s\n", dltxt_bridge::version);
             return 0;
         }
+
+        bridge_runtime::initialize_shared_thread_pool();
+        struct SharedThreadPoolShutdownGuard {
+            ~SharedThreadPoolShutdownGuard() {
+                bridge_runtime::shutdown_shared_thread_pool();
+            }
+        } shared_thread_pool_shutdown_guard;
 
         net::io_context ioc;
         auto stop_signals = install_stop_signals(ioc);

@@ -1,10 +1,12 @@
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -16,9 +18,11 @@
 #include "../bridge_app.hpp"
 #include "../bridge_documents.hpp"
 #include "../bridge_http_proxy.hpp"
+#include "../batch.hpp"
 #include "../bridge_local_requests.hpp"
 #include "../bridge_protocol.hpp"
 #include "../bridge_runtime.hpp"
+#include "../bridge_thread_pool.hpp"
 #include "../bridge_similarity_index.hpp"
 #include "../bridge_text_parser.hpp"
 
@@ -40,6 +44,12 @@ struct TestRegistrar {
         registered_tests().push_back(NamedTest{name, fn});
     }
 };
+
+inline constexpr auto valid_batch_callback = [](const bridge_documents::TextDocument&, std::size_t) {};
+inline constexpr auto invalid_batch_callback = [](int) {};
+
+static_assert(bridge_batch::BatchProcessCallback<decltype(valid_batch_callback)>);
+static_assert(!bridge_batch::BatchProcessCallback<decltype(invalid_batch_callback)>);
 
 std::string utf8_bytes(const char* text) {
     return std::string(text);
@@ -717,6 +727,147 @@ DEFINE_TEST(test_text_document_loader_reads_utf8_bom_file) {
     assert(bridge_documents::utf16_to_utf8(document.getLine(1)) == world);
 
     std::filesystem::remove(file_path);
+}
+
+DEFINE_TEST(test_batch_process_loads_documents_from_uris) {
+    const auto file_path_a = std::filesystem::temp_directory_path() / "dltxt_bridge_batch_a.txt";
+    const auto file_path_b = std::filesystem::temp_directory_path() / "dltxt_bridge_batch_b.txt";
+    {
+        std::ofstream output(file_path_a, std::ios::binary);
+        output << "alpha";
+    }
+    {
+        std::ofstream output(file_path_b, std::ios::binary);
+        output << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF");
+    }
+
+    const std::vector<std::string> uris{
+        bridge_documents::file_uri_from_path(file_path_a.string()),
+        bridge_documents::file_uri_from_path(file_path_b.string()),
+    };
+    std::vector<std::string> contents(uris.size());
+    std::vector<std::string> seen_uris(uris.size());
+    boost::asio::thread_pool pool(2);
+
+    bridge_batch::batch_process(
+        pool,
+        uris,
+        [&](const bridge_documents::TextDocument& document, std::size_t index) {
+            seen_uris[index] = document.getUri();
+            contents[index] = bridge_documents::utf16_to_utf8(document.getContent());
+        },
+        bridge_batch::BatchProcessOptions{2});
+
+    assert(seen_uris[0] == uris[0]);
+    assert(seen_uris[1] == uris[1]);
+    assert(contents[0] == "alpha");
+    assert(contents[1] == utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF"));
+
+    std::filesystem::remove(file_path_a);
+    std::filesystem::remove(file_path_b);
+}
+
+DEFINE_TEST(test_batch_process_reports_errors_and_continues) {
+    const auto valid_file_path = std::filesystem::temp_directory_path() / "dltxt_bridge_batch_valid.txt";
+    const auto missing_file_path = std::filesystem::temp_directory_path() / "dltxt_bridge_batch_missing.txt";
+    {
+        std::ofstream output(valid_file_path, std::ios::binary);
+        output << "ok";
+    }
+    std::filesystem::remove(missing_file_path);
+
+    const std::vector<std::string> uris{
+        bridge_documents::file_uri_from_path(valid_file_path.string()),
+        bridge_documents::file_uri_from_path(missing_file_path.string()),
+        bridge_documents::file_uri_from_path(valid_file_path.string()),
+    };
+
+    std::atomic<std::size_t> success_count = 0;
+    std::mutex error_mutex;
+    std::vector<std::string> failed_uris;
+    std::vector<std::size_t> failed_indices;
+    boost::asio::thread_pool pool(2);
+
+    bridge_batch::batch_process(
+        pool,
+        uris,
+        [&](const bridge_documents::TextDocument&, std::size_t) {
+            ++success_count;
+        },
+        bridge_batch::BatchProcessOptions{2},
+        [&](const std::string& uri, std::size_t index, std::exception_ptr error) {
+            assert(error != nullptr);
+            std::lock_guard<std::mutex> lock(error_mutex);
+            failed_uris.push_back(uri);
+            failed_indices.push_back(index);
+        });
+
+    assert(success_count == 2);
+    assert(failed_uris.size() == 1);
+    assert(failed_uris[0] == uris[1]);
+    assert(failed_indices[0] == 1);
+
+    std::filesystem::remove(valid_file_path);
+}
+
+DEFINE_TEST(test_batch_process_reuses_external_thread_pool) {
+    const auto file_path_a = std::filesystem::temp_directory_path() / "dltxt_bridge_batch_reuse_a.txt";
+    const auto file_path_b = std::filesystem::temp_directory_path() / "dltxt_bridge_batch_reuse_b.txt";
+    {
+        std::ofstream output(file_path_a, std::ios::binary);
+        output << "first";
+    }
+    {
+        std::ofstream output(file_path_b, std::ios::binary);
+        output << "second";
+    }
+
+    boost::asio::thread_pool pool(2);
+    std::vector<std::string> first_pass;
+    std::vector<std::string> second_pass;
+
+    bridge_batch::batch_process(
+        pool,
+        std::vector<std::string>{bridge_documents::file_uri_from_path(file_path_a.string())},
+        [&](const bridge_documents::TextDocument& document, std::size_t) {
+            first_pass.push_back(bridge_documents::utf16_to_utf8(document.getContent()));
+        });
+
+    bridge_batch::batch_process(
+        pool,
+        std::vector<std::string>{bridge_documents::file_uri_from_path(file_path_b.string())},
+        [&](const bridge_documents::TextDocument& document, std::size_t) {
+            second_pass.push_back(bridge_documents::utf16_to_utf8(document.getContent()));
+        });
+
+    assert(first_pass.size() == 1);
+    assert(second_pass.size() == 1);
+    assert(first_pass[0] == "first");
+    assert(second_pass[0] == "second");
+
+    std::filesystem::remove(file_path_a);
+    std::filesystem::remove(file_path_b);
+}
+
+DEFINE_TEST(test_shared_thread_pool_can_initialize_and_shutdown) {
+    bridge_runtime::shutdown_shared_thread_pool();
+    assert(!bridge_runtime::shared_thread_pool_initialized());
+
+    bridge_runtime::initialize_shared_thread_pool(2);
+    assert(bridge_runtime::shared_thread_pool_initialized());
+
+    std::atomic<int> counter = 0;
+    std::latch done(1);
+    boost::asio::post(bridge_runtime::shared_thread_pool(), [&]() {
+        ++counter;
+        done.count_down();
+    });
+    done.wait();
+
+    assert(counter == 1);
+
+    bridge_runtime::shutdown_shared_thread_pool();
+    assert(!bridge_runtime::shared_thread_pool_initialized());
 }
 
 DEFINE_TEST(test_utf_conversions_accept_empty_strings) {
