@@ -357,7 +357,7 @@ class CrossrefService {
     static void ingest_document(
         BuildState& state,
         const bridge_documents::TextDocument& document,
-        const bridge_text::StandardTextParser& parser,
+        const bridge_text::ITextParser& parser,
         bool is_open_document,
         const std::optional<std::filesystem::file_time_type>& timestamp = std::nullopt) {
         const std::string file_path = path_to_utf8(document.getFilePath());
@@ -392,7 +392,7 @@ class CrossrefService {
         const std::vector<bridge_documents::TextDocument>& open_documents,
         const ParserState& parser_state) {
         BuildState state;
-        bridge_text::StandardTextParser parser(parser_state.config);
+        const auto parser = bridge_text::make_text_parser(parser_state.config);
 
         fprintf(stderr, "[debug] crossref: build_state_from_snapshot start workspace_folders=%zu open_documents=%zu\n", workspace_folders.size(), open_documents.size());
 
@@ -419,7 +419,7 @@ class CrossrefService {
         for (const auto& uri : workspace_uris) {
             const auto open_document_it = open_documents_by_uri.find(uri);
             if (open_document_it != open_documents_by_uri.end()) {
-                ingest_document(state, open_document_it->second, parser, true);
+                ingest_document(state, open_document_it->second, *parser, true);
                 continue;
             }
 
@@ -427,7 +427,7 @@ class CrossrefService {
                 const auto document = bridge_batch::load_document_fast_from_uri(uri);
                 std::error_code error;
                 const auto timestamp = std::filesystem::last_write_time(document.getFilePath(), error);
-                ingest_document(state, document, parser, false, error ? std::nullopt : std::optional(timestamp));
+                ingest_document(state, document, *parser, false, error ? std::nullopt : std::optional(timestamp));
             } catch (...) {
                 // Ignore individual file load failures during background rebuilds.
             }
@@ -661,12 +661,12 @@ public:
         }
 
         boost::asio::post(pool, [this, document = std::move(document), parser_state = std::move(parser_state)]() mutable {
-            bridge_text::StandardTextParser parser(parser_state.config);
+            const auto parser = bridge_text::make_text_parser(parser_state.config);
             const std::string file_path = path_to_utf8(document.getFilePath());
             const std::string file_base_name = file_name_to_utf8(document.getFilePath());
 
             try {
-                const auto pairs = parser.parse_paired_lines(document.getContent());
+                const auto pairs = parser->parse_paired_lines(document.getContent());
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!parser_state_.has_value() || parser_state_->stamp != parser_state.stamp || !is_in_workspace_unlocked(document.getFilePath())) {
                     return;
@@ -723,8 +723,8 @@ public:
 
             try {
                 const auto document = bridge_batch::load_document_fast(file_path);
-                bridge_text::StandardTextParser parser(parser_state.config);
-                const auto pairs = parser.parse_paired_lines(document.getContent());
+                const auto parser = bridge_text::make_text_parser(parser_state.config);
+                const auto pairs = parser->parse_paired_lines(document.getContent());
                 std::error_code timestamp_error;
                 const auto timestamp = std::filesystem::last_write_time(file_path, timestamp_error);
 
@@ -790,11 +790,11 @@ public:
             return json{{"matches", json::array()}};
         }
 
-        bridge_text::StandardTextParser parser(parser_state->config);
+        const auto parser = bridge_text::make_text_parser(parser_state->config);
 
         std::vector<bridge_text::ParsedPair> current_pairs;
         try {
-            current_pairs = parser.parse_paired_lines(current_document.getContent());
+            current_pairs = parser->parse_paired_lines(current_document.getContent());
         } catch (...) {
             return json{{"matches", json::array()}};
         }

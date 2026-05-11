@@ -1344,6 +1344,86 @@ DEFINE_TEST(test_crossref_service_returns_bridge_matches_for_open_documents) {
     std::filesystem::remove_all(workspace_path);
 }
 
+DEFINE_TEST(test_crossref_service_returns_bridge_matches_for_text_block_parser) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::TextBlockConfig config{
+        "\\[BLOCK\\]\\r?\\n(?<jp>" + white_circle + "\\d+[TN]" + white_circle + ".*)\\r?\\n(?<cn>" + black_circle + "\\d+[TN]" + black_circle + ".*)\\r?\\n\\[/BLOCK\\]",
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_text_block_workspace";
+    std::filesystem::create_directories(workspace_path);
+    const auto current_file_path = workspace_path / "current.txt";
+    const auto other_file_path = workspace_path / "other.txt";
+
+    {
+        std::ofstream output(current_file_path, std::ios::binary);
+        output << "[BLOCK]\n"
+               << white_circle << "0001T" << white_circle << "old\n"
+               << black_circle << "0001T" << black_circle << "old\n"
+               << "[/BLOCK]\n";
+    }
+    {
+        std::ofstream output(other_file_path, std::ios::binary);
+        output << "[BLOCK]\n"
+               << white_circle << "0002T" << white_circle << "miss\n"
+               << black_circle << "0002T" << black_circle << "miss\n"
+               << "[/BLOCK]\n";
+    }
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+
+    const std::string current_uri = bridge_documents::file_uri_from_path(current_file_path);
+    const std::string other_uri = bridge_documents::file_uri_from_path(other_file_path);
+    manager.open_from_lsp(
+        current_uri,
+        "[BLOCK]\n"
+            + white_circle + "0001T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0001T" + black_circle + "hello\n"
+            + "[/BLOCK]\n",
+        3);
+    manager.open_from_lsp(
+        other_uri,
+        "[BLOCK]\n"
+            + white_circle + "0002T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0002T" + black_circle + "world\n"
+            + "[/BLOCK]\n",
+        4);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-text-block-open-docs"};
+    service.update_parser_config(
+        parser_state,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["lineNumber"] == 1);
+    assert(result["matches"][0]["exactCount"] == 1);
+    assert(result["matches"][0]["refs"].size() == 1);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["fileName"] == other_file_path.string());
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["trLine"] == "world");
+    assert(result["matches"][0]["refs"][0]["score"] == 100);
+
+    std::filesystem::remove_all(workspace_path);
+}
+
 DEFINE_TEST(test_crossref_service_preserves_japanese_quotes_in_json_results) {
     const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
     const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
@@ -2056,13 +2136,16 @@ DEFINE_TEST(test_local_request_dispatcher_round_trips_over_local_session) {
                     {"jsonrpc", "2.0"},
                     {"id", (*outbound_request)["id"]},
                     {"result", json{
-                        {"originalPrefixRegex", "JP"},
-                        {"translatedPrefixRegex", "CN"},
-                        {"otherPrefixRegex", "OTHER"},
-                        {"originalWhiteRegex", ""},
-                        {"translatedWhiteRegex", ""},
-                        {"originalSuffixRegex", ""},
-                        {"translatedSuffixRegex", ""}
+                        {"parserType", "standard"},
+                        {"parserConfig", json{
+                            {"originalPrefixRegex", "JP"},
+                            {"translatedPrefixRegex", "CN"},
+                            {"otherPrefixRegex", "OTHER"},
+                            {"originalWhiteRegex", ""},
+                            {"translatedWhiteRegex", ""},
+                            {"originalSuffixRegex", ""},
+                            {"translatedSuffixRegex", ""}
+                        }}
                     }}
                 },
                 response_manager);
@@ -2075,8 +2158,9 @@ DEFINE_TEST(test_local_request_dispatcher_round_trips_over_local_session) {
 
     assert(outbound_request.has_value());
     assert(response.has_value());
-    assert((*response)["result"]["originalPrefixRegex"] == "JP");
-    assert((*response)["result"]["translatedPrefixRegex"] == "CN");
+    assert((*response)["result"]["parserType"] == "standard");
+    assert((*response)["result"]["parserConfig"]["originalPrefixRegex"] == "JP");
+    assert((*response)["result"]["parserConfig"]["translatedPrefixRegex"] == "CN");
 }
 
 DEFINE_TEST(test_standard_text_parser_builds_from_runtime_regex_request) {
@@ -2092,13 +2176,16 @@ DEFINE_TEST(test_standard_text_parser_builds_from_runtime_regex_request) {
                         {"jsonrpc", "2.0"},
                         {"id", "local-client-1"},
                         {"result", bridge_text::json{
-                            {"originalPrefixRegex", "A"},
-                            {"translatedPrefixRegex", "B"},
-                            {"otherPrefixRegex", ""},
-                            {"originalWhiteRegex", ""},
-                            {"translatedWhiteRegex", ""},
-                            {"originalSuffixRegex", ""},
-                            {"translatedSuffixRegex", ""}
+                            {"parserType", "standard"},
+                            {"parserConfig", bridge_text::json{
+                                {"originalPrefixRegex", "A"},
+                                {"translatedPrefixRegex", "B"},
+                                {"otherPrefixRegex", ""},
+                                {"originalWhiteRegex", ""},
+                                {"translatedWhiteRegex", ""},
+                                {"originalSuffixRegex", ""},
+                                {"translatedSuffixRegex", ""}
+                            }}
                         }}
                     };
                 });
@@ -2114,6 +2201,85 @@ DEFINE_TEST(test_standard_text_parser_builds_from_runtime_regex_request) {
     assert(pairs->size() == 1);
     assert((*pairs)[0].original.text == u"\u3053\u3093\u306B\u3061\u306F");
     assert((*pairs)[0].translated.text == u"\u4F60\u597D");
+}
+
+DEFINE_TEST(test_runtime_parser_factory_builds_text_block_parser_from_runtime_request) {
+    net::io_context ioc;
+    std::optional<std::vector<bridge_text::ParsedPair>> pairs;
+
+    net::co_spawn(ioc,
+        [&]() -> net::awaitable<void> {
+            auto parser = co_await bridge_text::create_text_parser_from_request_sender(
+                [](const std::string& method, const bridge_text::json&) -> net::awaitable<bridge_text::json> {
+                    assert(method == "dltxt/get_parser_regex");
+                    co_return bridge_text::json{
+                        {"jsonrpc", "2.0"},
+                        {"id", "local-client-2"},
+                        {"result", bridge_text::json{
+                            {"parserType", "text-block"},
+                            {"parserConfig", bridge_text::json{
+                                {"pattern", "\\[BLOCK\\]\\r?\\n(?<jp>A.*)\\r?\\n(?<cn>B.*)\\r?\\n\\[/BLOCK\\]"},
+                                {"originalPrefixRegex", "A"},
+                                {"translatedPrefixRegex", "B"},
+                                {"originalWhiteRegex", "\\s*"},
+                                {"translatedWhiteRegex", "\\s*"},
+                                {"originalSuffixRegex", ""},
+                                {"translatedSuffixRegex", ""}
+                            }}
+                        }}
+                    };
+                });
+
+            pairs = parser->parse_paired_lines(u"[BLOCK]\nA  \u3053\u3093\u306B\u3061\u306F\nB  \u4F60\u597D\n[/BLOCK]\n");
+            co_return;
+        },
+        net::detached);
+
+    ioc.run();
+
+    assert(pairs.has_value());
+    assert(pairs->size() == 1);
+    assert((*pairs)[0].original_line_index == 1);
+    assert((*pairs)[0].translated_line_index == 2);
+    assert((*pairs)[0].original.text == u"\u3053\u3093\u306B\u3061\u306F");
+    assert((*pairs)[0].translated.text == u"\u4F60\u597D");
+    assert((*pairs)[0].original.white == u"  ");
+    assert((*pairs)[0].translated.white == u"  ");
+}
+
+DEFINE_TEST(test_text_block_parser_supports_multiline_anchors_like_extension_regex) {
+    const bridge_text::TextBlockConfig config{
+        "^-+\\d+-+(\\r)?\\n((\\*+)|(\\[[^\\]]*\\]))(\\r)?\\n(?<jp>.*)(\\r)?\\n=+(\\r)?\\n(?<cn>.*)((\\r)?\\n)*$",
+        "",
+        "",
+        "",
+        "",
+        "[」』）]?",
+        "[」』）]?",
+    };
+    const bridge_text::TextBlockParser parser(config);
+
+    const auto pairs = parser.parse_paired_lines(bridge_documents::utf8_to_utf16(
+        "-----------------------------0001-----------------------------\n"
+        "**\n"
+        "jp-1\n"
+        "=========\n"
+        "cn-1\n"
+        "-----------------------------0002-----------------------------\n"
+        "**\n"
+        "jp-2\n"
+        "=========\n"
+        "cn-2\n"));
+
+    assert(pairs.size() == 2);
+    assert(pairs[0].original_line_index == 2);
+    assert(pairs[0].translated_line_index == 4);
+    assert(pairs[0].original.text == u"jp-1");
+    assert(pairs[0].translated.text == u"cn-1");
+    assert(pairs[1].original_line_index == 7);
+    assert(pairs[1].translated_line_index == 9);
+    assert(pairs[1].original.text == u"jp-2");
+    assert(pairs[1].translated.text == u"cn-2");
 }
 
 DEFINE_TEST(test_standard_text_parser_parses_regex_with_extra_user_captures) {

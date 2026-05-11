@@ -450,10 +450,10 @@ net::awaitable<void> handle_local_session(
                         continue;
                     } else if (params["parserRegex"].is_object()) {
                         bridge_text::ParserState parser_state{
-                            bridge_text::regex_config_from_json(params["parserRegex"]),
+                            bridge_text::parser_config_from_json(params["parserRegex"]),
                             params["parserRegex"].dump(),
                         };
-                        bridge_text::set_global_text_parser(std::make_shared<bridge_text::StandardTextParser>(parser_state.config));
+                        bridge_text::set_global_text_parser(bridge_text::make_text_parser(parser_state.config));
                         crossref_service->update_parser_config(
                             parser_state,
                             document_manager->workspace_folders_snapshot(),
