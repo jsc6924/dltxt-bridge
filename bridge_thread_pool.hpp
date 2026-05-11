@@ -58,7 +58,7 @@ inline SharedThreadPool& shared_thread_pool_state() {
     return state;
 }
 
-inline void initialize_shared_thread_pool(std::size_t thread_count = std::max<std::size_t>(2, std::thread::hardware_concurrency())) {
+inline void initialize_shared_thread_pool(std::size_t thread_count = std::max<std::size_t>(2, std::thread::hardware_concurrency() / 4)) {
     shared_thread_pool_state().initialize(thread_count);
 }
 

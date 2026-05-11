@@ -519,6 +519,7 @@ class CrossrefService {
     }
 
     std::vector<LineSearchResult> search_line(
+        boost::asio::thread_pool& pool,
         std::u16string_view query,
         int threshold,
         std::size_t limit,
@@ -528,7 +529,7 @@ class CrossrefService {
         std::size_t* exact_count) const {
         const auto raw_candidates = [&]() {
             std::lock_guard<std::mutex> lock(mutex_);
-            return index_.search(query, 0.0, (std::max)(limit * 3, std::size_t{16}));
+            return index_.search(pool, query, 0.0, (std::max)(limit * 3, std::size_t{16}));
         }();
 
         std::vector<LineSearchResult> filtered;
@@ -797,10 +798,11 @@ public:
         json matches = json::array();
         // calculate execution time for each line, and sum them up
         std::chrono::duration<double> total_duration(0);
+        boost::asio::thread_pool pool(std::thread::hardware_concurrency());
         for (const auto& pair : current_pairs) {
             auto start_time = std::chrono::high_resolution_clock::now();
             std::size_t exact_count = 0;
-            auto refs = search_line(pair.original.text, threshold, limit, current_file_path, current_base_name, pair.original_line_index, &exact_count);
+            auto refs = search_line(pool, pair.original.text, threshold, limit, current_file_path, current_base_name, pair.original_line_index, &exact_count);
             auto end_time = std::chrono::high_resolution_clock::now();
             fprintf(stderr, "Search time for line %zu: %.3f seconds\n", pair.original_line_index, std::chrono::duration<double>(end_time - start_time).count());
             total_duration += end_time - start_time;

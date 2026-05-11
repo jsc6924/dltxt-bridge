@@ -6,14 +6,20 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <exception>
+#include <latch>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <boost/asio/post.hpp>
+#include <boost/asio/thread_pool.hpp>
 
 namespace bridge_similarity {
 
@@ -232,6 +238,7 @@ public:
     }
 
     std::vector<SearchResult> search(
+        boost::asio::thread_pool& pool,
         std::u16string_view query,
         double min_score = 0.0,
         std::size_t max_results = 10) const {
@@ -327,56 +334,106 @@ public:
         const auto candidates_built_at = Clock::now();
 
         const double query_norm = std::sqrt(query_norm_squared);
+        const std::vector<LineId> candidate_list(candidate_ids.begin(), candidate_ids.end());
         std::vector<SearchResult> results;
-        results.reserve(candidate_ids.size());
+        results.reserve(candidate_list.size());
 
-        for (LineId candidate_id : candidate_ids) {
-            const auto line_it = lines_.find(candidate_id);
-            if (line_it == lines_.end()) {
-                continue;
-            }
+        auto score_candidate_range = [&](std::size_t begin, std::size_t end, std::vector<SearchResult>& local_results) {
+            local_results.reserve(end - begin);
 
-            const IndexedLine& line = line_it->second;
-            const double document_norm = line_norm(line);
-            if (document_norm <= 0.0) {
-                continue;
-            }
+            for (std::size_t index = begin; index < end; ++index) {
+                const LineId candidate_id = candidate_list[index];
+                const auto line_it = lines_.find(candidate_id);
+                if (line_it == lines_.end()) {
+                    continue;
+                }
 
-            double dot_product = 0.0;
-            auto query_it = query_term_frequency.begin();
-            auto line_term_it = line.term_frequency.begin();
-            while (query_it != query_term_frequency.end() && line_term_it != line.term_frequency.end()) {
-                if (query_it->first < line_term_it->first) {
+                const IndexedLine& line = line_it->second;
+                const double document_norm = line_norm(line);
+                if (document_norm <= 0.0) {
+                    continue;
+                }
+
+                double dot_product = 0.0;
+                auto query_it = query_term_frequency.begin();
+                auto line_term_it = line.term_frequency.begin();
+                while (query_it != query_term_frequency.end() && line_term_it != line.term_frequency.end()) {
+                    if (query_it->first < line_term_it->first) {
+                        ++query_it;
+                        continue;
+                    }
+
+                    if (line_term_it->first < query_it->first) {
+                        ++line_term_it;
+                        continue;
+                    }
+
+                    const double query_weight = query_weights.at(query_it->first);
+                    dot_product += query_weight * (static_cast<double>(line_term_it->second) * current_idf(line_term_it->first));
                     ++query_it;
-                    continue;
-                }
-
-                if (line_term_it->first < query_it->first) {
                     ++line_term_it;
+                }
+
+                if (dot_product <= 0.0) {
                     continue;
                 }
 
-                const double query_weight = query_weights.at(query_it->first);
-                dot_product += query_weight * (static_cast<double>(line_term_it->second) * current_idf(line_term_it->first));
-                ++query_it;
-                ++line_term_it;
+                const double score = dot_product / (query_norm * document_norm);
+                if (score < min_score) {
+                    continue;
+                }
+
+                local_results.push_back(SearchResult{
+                    line.line_id,
+                    file_paths_by_id_[line.file_id],
+                    line.line_number,
+                    score,
+                });
+            }
+        };
+
+        const std::size_t min_parallel_candidates = 128;
+        const std::size_t target_chunk_size = 64;
+        const std::size_t max_parallel_tasks = (std::max)(std::size_t{1}, std::min<std::size_t>(4, std::thread::hardware_concurrency()));
+        const std::size_t parallel_task_count = candidate_list.size() < min_parallel_candidates
+            ? std::size_t{1}
+            : (std::min)(max_parallel_tasks, (candidate_list.size() + target_chunk_size - 1) / target_chunk_size);
+
+        if (parallel_task_count == 1) {
+            score_candidate_range(0, candidate_list.size(), results);
+        } else {
+            std::vector<std::vector<SearchResult>> partial_results(parallel_task_count);
+            std::exception_ptr worker_exception;
+            std::mutex worker_exception_mutex;
+            std::latch scoring_done(static_cast<std::ptrdiff_t>(parallel_task_count));
+            const std::size_t chunk_size = (candidate_list.size() + parallel_task_count - 1) / parallel_task_count;
+
+            for (std::size_t task_index = 0; task_index < parallel_task_count; ++task_index) {
+                const std::size_t begin = task_index * chunk_size;
+                const std::size_t end = (std::min)(candidate_list.size(), begin + chunk_size);
+                boost::asio::post(pool, [&, task_index, begin, end]() {
+                    try {
+                        score_candidate_range(begin, end, partial_results[task_index]);
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(worker_exception_mutex);
+                        if (!worker_exception) {
+                            worker_exception = std::current_exception();
+                        }
+                    }
+                    scoring_done.count_down();
+                });
             }
 
-            if (dot_product <= 0.0) {
-                continue;
+            scoring_done.wait();
+            if (worker_exception) {
+                std::rethrow_exception(worker_exception);
             }
 
-            const double score = dot_product / (query_norm * document_norm);
-            if (score < min_score) {
-                continue;
+            for (auto& partial_result : partial_results) {
+                results.insert(results.end(),
+                    std::make_move_iterator(partial_result.begin()),
+                    std::make_move_iterator(partial_result.end()));
             }
-
-            results.push_back(SearchResult{
-                line.line_id,
-                file_paths_by_id_[line.file_id],
-                line.line_number,
-                score,
-            });
         }
 
         const auto scoring_finished_at = Clock::now();
@@ -416,6 +473,16 @@ public:
             to_milliseconds(search_finished_at - scoring_finished_at),
             to_milliseconds(search_finished_at - search_started_at));
 
+        return results;
+    }
+
+    std::vector<SearchResult> search(
+        std::u16string_view query,
+        double min_score = 0.0,
+        std::size_t max_results = 10) const {
+        boost::asio::thread_pool pool(1);
+        std::vector<SearchResult> results = search(pool, query, min_score, max_results);
+        pool.join();
         return results;
     }
 
