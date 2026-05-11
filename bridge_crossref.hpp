@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -132,6 +133,11 @@ class CrossrefService {
 
     static bool is_supported_path(const std::filesystem::path& path) {
         return is_text_file(path);
+    }
+
+    static boost::asio::thread_pool& search_thread_pool() {
+        static boost::asio::thread_pool pool((std::max)(2u, std::thread::hardware_concurrency()));
+        return pool;
     }
 
     static std::u16string remove_space(std::u16string_view text) {
@@ -798,11 +804,10 @@ public:
         json matches = json::array();
         // calculate execution time for each line, and sum them up
         std::chrono::duration<double> total_duration(0);
-        boost::asio::thread_pool pool(std::thread::hardware_concurrency());
         for (const auto& pair : current_pairs) {
             auto start_time = std::chrono::high_resolution_clock::now();
             std::size_t exact_count = 0;
-            auto refs = search_line(pool, pair.original.text, threshold, limit, current_file_path, current_base_name, pair.original_line_index, &exact_count);
+            auto refs = search_line(search_thread_pool(), pair.original.text, threshold, limit, current_file_path, current_base_name, pair.original_line_index, &exact_count);
             auto end_time = std::chrono::high_resolution_clock::now();
             fprintf(stderr, "Search time for line %zu: %.3f seconds\n", pair.original_line_index, std::chrono::duration<double>(end_time - start_time).count());
             total_duration += end_time - start_time;
