@@ -29,7 +29,7 @@ struct SearchResult {
 class SimilarityIndex {
     using Term = std::u16string;
     using TermId = std::uint32_t;
-    using TermFrequencyMap = std::unordered_map<TermId, std::uint32_t>;
+    using TermFrequencyMap = std::vector<std::pair<TermId, std::uint32_t>>; // Sorted vector of (term_id, frequency) pairs
     static constexpr std::size_t kMaxCandidateBudget = 1024;
 
     struct IndexedLine {
@@ -41,7 +41,7 @@ class SimilarityIndex {
 
     std::unordered_map<LineId, IndexedLine> lines_;
     std::unordered_map<TermId, std::size_t> document_frequency_;
-    std::unordered_map<TermId, std::unordered_set<LineId>> postings_;
+    std::unordered_map<TermId, std::vector<LineId>> postings_; // Inverted index: term_id -> sorted list of line_ids containing the term.
     std::unordered_map<Term, TermId> term_ids_by_value_;
     std::vector<Term> term_values_by_id_;
     std::vector<std::size_t> term_ref_counts_;
@@ -52,6 +52,7 @@ class SimilarityIndex {
     template <typename ResolveTermId>
     static TermFrequencyMap build_term_frequency(std::u16string_view text, ResolveTermId&& resolve_term_id) {
         TermFrequencyMap frequencies;
+        std::vector<std::uint32_t> seen_term_ids;
 
         for (std::size_t gram_size : {std::size_t{2}}) {
             if (text.size() < gram_size) {
@@ -64,7 +65,15 @@ class SimilarityIndex {
                     continue;
                 }
 
-                ++frequencies[*maybe_term_id];
+                seen_term_ids.push_back(*maybe_term_id);
+            }
+        }
+        std::sort(seen_term_ids.begin(), seen_term_ids.end());
+        for (TermId term_id : seen_term_ids) {
+            if (!frequencies.empty() && frequencies.back().first == term_id) {
+                ++frequencies.back().second;
+            } else {
+                frequencies.emplace_back(term_id, 1);
             }
         }
 
@@ -148,7 +157,7 @@ class SimilarityIndex {
 
     static void insert_candidates_up_to_budget(
         std::unordered_set<LineId>& candidate_ids,
-        const std::unordered_set<LineId>& posting,
+        const std::vector<LineId>& posting,
         std::size_t candidate_budget) {
         for (LineId candidate_id : posting) {
             candidate_ids.insert(candidate_id);
@@ -173,7 +182,15 @@ public:
         for (const auto& [term_id, count] : indexed_line.term_frequency) {
             (void)count;
             ++document_frequency_[term_id];
-            postings_[term_id].insert(line_id);
+            auto& posting = postings_[term_id];
+            if (posting.empty() || posting.back() < line_id) {
+                posting.push_back(line_id);
+                continue;
+            }
+            const auto insert_it = std::lower_bound(posting.begin(), posting.end(), line_id);
+            if (insert_it == posting.end() || *insert_it != line_id) {
+                posting.insert(insert_it, line_id);
+            }
         }
 
         lines_.emplace(line_id, std::move(indexed_line));
@@ -189,7 +206,11 @@ public:
             (void)count;
             auto posting_it = postings_.find(term_id);
             if (posting_it != postings_.end()) {
-                posting_it->second.erase(line_id);
+                auto& posting = posting_it->second;
+                const auto erase_it = std::lower_bound(posting.begin(), posting.end(), line_id);
+                if (erase_it != posting.end() && *erase_it == line_id) {
+                    posting.erase(erase_it);
+                }
                 if (posting_it->second.empty()) {
                     postings_.erase(posting_it);
                 }
@@ -322,13 +343,23 @@ public:
             }
 
             double dot_product = 0.0;
-            for (const auto& [term_id, query_weight] : query_weights) {
-                const auto term_it = line.term_frequency.find(term_id);
-                if (term_it == line.term_frequency.end()) {
+            auto query_it = query_term_frequency.begin();
+            auto line_term_it = line.term_frequency.begin();
+            while (query_it != query_term_frequency.end() && line_term_it != line.term_frequency.end()) {
+                if (query_it->first < line_term_it->first) {
+                    ++query_it;
                     continue;
                 }
 
-                dot_product += query_weight * (static_cast<double>(term_it->second) * current_idf(term_id));
+                if (line_term_it->first < query_it->first) {
+                    ++line_term_it;
+                    continue;
+                }
+
+                const double query_weight = query_weights.at(query_it->first);
+                dot_product += query_weight * (static_cast<double>(line_term_it->second) * current_idf(line_term_it->first));
+                ++query_it;
+                ++line_term_it;
             }
 
             if (dot_product <= 0.0) {
