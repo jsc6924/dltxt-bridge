@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -46,6 +47,142 @@ struct LineSearchResult {
 
 class CrossrefService {
 
+    struct GitIgnoreRule {
+        std::filesystem::path base_dir;
+        std::string pattern;
+        bool negated = false;
+        bool directory_only = false;
+        bool basename_only = false;
+        std::size_t base_depth = 0;
+        std::size_t order = 0;
+    };
+
+    struct WorkspaceGitIgnoreRules {
+        std::filesystem::path root_path;
+        std::vector<GitIgnoreRule> rules;
+
+        bool ignores(const std::filesystem::path& path, bool is_directory = false) const {
+            const std::filesystem::path normalized_root = root_path.lexically_normal();
+            const std::filesystem::path normalized_path = path.lexically_normal();
+            if (normalized_root.empty()) {
+                return false;
+            }
+
+            bool ignored = false;
+            for (const auto& rule : rules) {
+                const std::filesystem::path normalized_base = rule.base_dir.lexically_normal();
+                if (normalized_base.empty()) {
+                    continue;
+                }
+
+                if (!CrossrefService::path_is_within_root(normalized_path, normalized_base)) {
+                    continue;
+                }
+
+                const std::filesystem::path relative_path = normalized_path.lexically_relative(normalized_base);
+                if (relative_path.empty()) {
+                    continue;
+                }
+
+                if (matches_rule(rule, relative_path, is_directory)) {
+                    ignored = !rule.negated;
+                }
+            }
+
+            return ignored;
+        }
+
+    private:
+        static bool matches_rule(const GitIgnoreRule& rule, const std::filesystem::path& relative_path, bool is_directory) {
+            const std::vector<std::string> directory_candidates = build_directory_candidates(relative_path, is_directory);
+            const std::string full_candidate = CrossrefService::path_to_utf8(relative_path.lexically_normal());
+
+            if (rule.basename_only) {
+                for (const auto& candidate : directory_candidates) {
+                    if (wildcard_match(rule.pattern, base_name(candidate))) {
+                        return true;
+                    }
+                }
+                if (!rule.directory_only && wildcard_match(rule.pattern, base_name(full_candidate))) {
+                    return true;
+                }
+                return false;
+            }
+
+            for (const auto& candidate : directory_candidates) {
+                if (wildcard_match(rule.pattern, candidate)) {
+                    return true;
+                }
+            }
+
+            return !rule.directory_only && wildcard_match(rule.pattern, full_candidate);
+        }
+
+        static std::vector<std::string> build_directory_candidates(const std::filesystem::path& relative_path, bool is_directory) {
+            std::vector<std::string> candidates;
+            std::filesystem::path current;
+            const std::filesystem::path normalized = relative_path.lexically_normal();
+
+            for (auto it = normalized.begin(); it != normalized.end(); ++it) {
+                const bool is_last = std::next(it) == normalized.end();
+                current /= *it;
+                if (!is_last || is_directory) {
+                    candidates.push_back(CrossrefService::path_to_utf8(current));
+                }
+            }
+
+            return candidates;
+        }
+
+        static std::string base_name(const std::string& candidate) {
+            const std::size_t pos = candidate.find_last_of('/');
+            return pos == std::string::npos ? candidate : candidate.substr(pos + 1);
+        }
+
+        static bool wildcard_match(const std::string& pattern, const std::string& text) {
+            std::vector<std::vector<int>> memo(pattern.size() + 1, std::vector<int>(text.size() + 1, -1));
+
+            const auto match_impl = [&](const auto& self, std::size_t pattern_index, std::size_t text_index) -> bool {
+                int& cached = memo[pattern_index][text_index];
+                if (cached != -1) {
+                    return cached == 1;
+                }
+
+                bool matched = false;
+                if (pattern_index == pattern.size()) {
+                    matched = text_index == text.size();
+                } else if (pattern[pattern_index] == '\\' && pattern_index + 1 < pattern.size()) {
+                    matched = text_index < text.size()
+                        && pattern[pattern_index + 1] == text[text_index]
+                        && self(self, pattern_index + 2, text_index + 1);
+                } else if (pattern[pattern_index] == '*') {
+                    const bool double_star = pattern_index + 1 < pattern.size() && pattern[pattern_index + 1] == '*';
+                    const std::size_t next_pattern = pattern_index + (double_star ? 2 : 1);
+                    matched = self(self, next_pattern, text_index);
+                    for (std::size_t index = text_index; !matched && index < text.size(); ++index) {
+                        if (!double_star && text[index] == '/') {
+                            break;
+                        }
+                        matched = self(self, next_pattern, index + 1);
+                    }
+                } else if (pattern[pattern_index] == '?') {
+                    matched = text_index < text.size()
+                        && text[text_index] != '/'
+                        && self(self, pattern_index + 1, text_index + 1);
+                } else {
+                    matched = text_index < text.size()
+                        && pattern[pattern_index] == text[text_index]
+                        && self(self, pattern_index + 1, text_index + 1);
+                }
+
+                cached = matched ? 1 : 0;
+                return matched;
+            };
+
+            return match_impl(match_impl, 0, 0);
+        }
+    };
+
     struct BuildState {
         bridge_similarity::SimilarityIndex index;
         std::unordered_map<bridge_similarity::LineId, LineInfo> line_infos;
@@ -53,6 +190,7 @@ class CrossrefService {
         std::unordered_map<std::string, int> open_document_versions;
         std::unordered_map<std::string, std::filesystem::file_time_type> disk_file_timestamps;
         std::vector<std::filesystem::path> workspace_root_paths;
+        std::vector<WorkspaceGitIgnoreRules> workspace_gitignore_rules;
         std::unordered_set<std::string> indexed_file_paths;
         bridge_similarity::LineId next_line_id = 1;
     };
@@ -65,6 +203,7 @@ class CrossrefService {
     std::unordered_map<std::string, int> open_document_versions_;
     std::unordered_map<std::string, std::filesystem::file_time_type> disk_file_timestamps_;
     std::vector<std::filesystem::path> workspace_root_paths_;
+    std::vector<WorkspaceGitIgnoreRules> workspace_gitignore_rules_;
     std::unordered_set<std::string> indexed_file_paths_;
     std::optional<ParserState> parser_state_;
     std::function<void()> index_ready_notifier_;
@@ -109,6 +248,14 @@ class CrossrefService {
             || extension == ".7z" || extension == ".7Z";
     }
 
+    static bool is_gitignore_file(const std::filesystem::path& path) {
+        return file_name_to_utf8(path) == ".gitignore";
+    }
+
+    static std::filesystem::path workspace_dltxt_ignore_path(const std::filesystem::path& workspace_path) {
+        return workspace_path / ".dltxt" / "ignore";
+    }
+
     static bool should_skip_directory(const std::filesystem::directory_entry& entry, const std::filesystem::path& path) {
         if (is_hidden_name(path) || is_archive_directory_name(path)) {
             return true;
@@ -133,6 +280,197 @@ class CrossrefService {
 
     static bool is_supported_path(const std::filesystem::path& path) {
         return is_text_file(path);
+    }
+
+    static std::string trim_gitignore_line(std::string line) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+            line.pop_back();
+        }
+        return line;
+    }
+
+    static std::string normalize_gitignore_pattern(std::string pattern) {
+        std::replace(pattern.begin(), pattern.end(), '\\', '/');
+        return pattern;
+    }
+
+    static bool is_probably_text_content(const std::string& content) {
+        return content.find('\0') == std::string::npos;
+    }
+
+    static std::vector<GitIgnoreRule> parse_ignore_rules_content(
+        const std::filesystem::path& base_dir,
+        std::string_view content) {
+        std::vector<GitIgnoreRule> rules;
+        std::size_t offset = 0;
+        std::size_t order = 0;
+
+        while (offset <= content.size()) {
+            const std::size_t line_end = content.find('\n', offset);
+            const std::size_t line_size = line_end == std::string_view::npos ? content.size() - offset : line_end - offset;
+            std::string line(content.substr(offset, line_size));
+            line = trim_gitignore_line(std::move(line));
+            if (line_end == std::string_view::npos) {
+                offset = content.size() + 1;
+            } else {
+                offset = line_end + 1;
+            }
+
+            if (line.empty()) {
+                continue;
+            }
+
+            if (line[0] == '\\' && line.size() > 1 && (line[1] == '#' || line[1] == '!')) {
+                line.erase(line.begin());
+            } else if (line[0] == '#') {
+                continue;
+            }
+
+            GitIgnoreRule rule;
+            rule.base_dir = base_dir;
+            rule.base_depth = static_cast<std::size_t>(std::distance(rule.base_dir.begin(), rule.base_dir.end()));
+            rule.order = order++;
+            rule.negated = !line.empty() && line.front() == '!';
+            if (rule.negated) {
+                line.erase(line.begin());
+            }
+
+            line = normalize_gitignore_pattern(std::move(line));
+            if (line.empty()) {
+                continue;
+            }
+
+            rule.directory_only = !line.empty() && line.back() == '/';
+            if (rule.directory_only) {
+                line.pop_back();
+            }
+            if (!line.empty() && line.front() == '/') {
+                line.erase(line.begin());
+            }
+
+            if (line.empty()) {
+                continue;
+            }
+
+            rule.pattern = std::move(line);
+            rule.basename_only = rule.pattern.find('/') == std::string::npos;
+            rules.push_back(std::move(rule));
+        }
+
+        return rules;
+    }
+
+    static std::vector<GitIgnoreRule> load_ignore_rules_file(
+        const std::filesystem::path& path,
+        bool require_text_content,
+        const std::optional<std::filesystem::path>& base_dir_override = std::nullopt) {
+        std::vector<GitIgnoreRule> rules;
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            return rules;
+        }
+
+        std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if (require_text_content && !is_probably_text_content(content)) {
+            return rules;
+        }
+
+        return parse_ignore_rules_content(base_dir_override.value_or(path.parent_path()), content);
+    }
+
+    static std::vector<GitIgnoreRule> load_gitignore_rules(const std::filesystem::path& gitignore_path) {
+        return load_ignore_rules_file(gitignore_path, false);
+    }
+
+    static WorkspaceGitIgnoreRules build_workspace_gitignore_rules(const std::filesystem::path& workspace_path) {
+        WorkspaceGitIgnoreRules workspace_rules;
+        workspace_rules.root_path = workspace_path.lexically_normal();
+
+        const std::filesystem::path dltxt_ignore_path = workspace_dltxt_ignore_path(workspace_path);
+        {
+            std::error_code dltxt_ignore_error;
+            if (std::filesystem::is_regular_file(dltxt_ignore_path, dltxt_ignore_error) && !dltxt_ignore_error) {
+                auto rules = load_ignore_rules_file(dltxt_ignore_path, true, workspace_path);
+                workspace_rules.rules.insert(
+                    workspace_rules.rules.end(),
+                    std::make_move_iterator(rules.begin()),
+                    std::make_move_iterator(rules.end()));
+            }
+        }
+
+        std::error_code error;
+        std::filesystem::recursive_directory_iterator iterator(
+            workspace_path,
+            std::filesystem::directory_options::skip_permission_denied,
+            error);
+        std::filesystem::recursive_directory_iterator end;
+
+        while (!error && iterator != end) {
+            const std::filesystem::directory_entry entry = *iterator;
+            const std::filesystem::path current_path = entry.path();
+
+            if (entry.is_directory(error)) {
+                if (!error && should_skip_directory(entry, current_path)) {
+                    iterator.disable_recursion_pending();
+                }
+                iterator.increment(error);
+                continue;
+            }
+
+            if (!error && entry.is_regular_file(error) && is_gitignore_file(current_path)) {
+                auto rules = load_gitignore_rules(current_path);
+                workspace_rules.rules.insert(
+                    workspace_rules.rules.end(),
+                    std::make_move_iterator(rules.begin()),
+                    std::make_move_iterator(rules.end()));
+            }
+
+            error.clear();
+            iterator.increment(error);
+        }
+
+        std::sort(workspace_rules.rules.begin(), workspace_rules.rules.end(), [](const GitIgnoreRule& left, const GitIgnoreRule& right) {
+            if (left.base_depth != right.base_depth) {
+                return left.base_depth < right.base_depth;
+            }
+            if (left.base_dir != right.base_dir) {
+                return left.base_dir.generic_string() < right.base_dir.generic_string();
+            }
+            return left.order < right.order;
+        });
+
+        return workspace_rules;
+    }
+
+    static std::vector<WorkspaceGitIgnoreRules> build_workspace_gitignore_rules(const std::vector<std::string>& workspace_folders) {
+        std::vector<WorkspaceGitIgnoreRules> rules;
+        rules.reserve(workspace_folders.size());
+
+        for (const auto& workspace_folder_uri : workspace_folders) {
+            std::error_code error;
+            const std::filesystem::path workspace_path = bridge_documents::file_path_from_uri(workspace_folder_uri);
+            if (!std::filesystem::exists(workspace_path, error) || error) {
+                continue;
+            }
+            rules.push_back(build_workspace_gitignore_rules(workspace_path));
+        }
+
+        return rules;
+    }
+
+    static bool is_gitignored(
+        const std::filesystem::path& path,
+        const std::vector<WorkspaceGitIgnoreRules>& workspace_gitignore_rules,
+        bool is_directory = false) {
+        for (const auto& workspace_rules : workspace_gitignore_rules) {
+            if (!path_is_within_root(path, workspace_rules.root_path)) {
+                continue;
+            }
+            if (workspace_rules.ignores(path, is_directory)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static boost::asio::thread_pool& search_thread_pool() {
@@ -210,7 +548,9 @@ class CrossrefService {
         return static_cast<int>(std::lround(100.0 * similarity));
     }
 
-    static std::vector<std::string> collect_workspace_text_uris(const std::vector<std::string>& workspace_folders) {
+    static std::vector<std::string> collect_workspace_text_uris(
+        const std::vector<std::string>& workspace_folders,
+        const std::vector<WorkspaceGitIgnoreRules>& workspace_gitignore_rules) {
         std::vector<std::string> uris;
 
         for (const auto& workspace_folder_uri : workspace_folders) {
@@ -241,14 +581,18 @@ class CrossrefService {
                 }
 
                 if (entry.is_directory(error)) {
-                    if (!error && should_skip_directory(entry, current_path)) {
+                    if (!error && (should_skip_directory(entry, current_path)
+                        || is_gitignored(current_path, workspace_gitignore_rules, true))) {
                         iterator.disable_recursion_pending();
                     }
                     iterator.increment(error);
                     continue;
                 }
 
-                if (!error && entry.is_regular_file(error) && !is_hidden_name(current_path) && is_text_file(current_path)) {
+                if (!error && entry.is_regular_file(error)
+                    && !is_hidden_name(current_path)
+                    && is_text_file(current_path)
+                    && !is_gitignored(current_path, workspace_gitignore_rules)) {
                     try {
                         uris.push_back(bridge_documents::file_uri_from_path(current_path));
                     } catch (const std::exception& ex) {
@@ -288,6 +632,7 @@ class CrossrefService {
         open_document_versions_.clear();
         disk_file_timestamps_.clear();
         workspace_root_paths_.clear();
+        workspace_gitignore_rules_.clear();
         indexed_file_paths_.clear();
         applied_generation_ = rebuild_generation_;
         next_line_id_ = 1;
@@ -314,7 +659,7 @@ class CrossrefService {
     bool is_in_workspace_unlocked(const std::filesystem::path& file_path) const {
         return std::any_of(workspace_root_paths_.begin(), workspace_root_paths_.end(), [&](const std::filesystem::path& root_path) {
             return path_is_within_root(file_path, root_path);
-        });
+        }) && !is_gitignored(file_path, workspace_gitignore_rules_);
     }
 
     void erase_file_unlocked(const std::string& file_path) {
@@ -400,6 +745,7 @@ class CrossrefService {
         for (const auto& workspace_folder_uri : workspace_folders) {
             state.workspace_root_paths.push_back(bridge_documents::file_path_from_uri(workspace_folder_uri));
         }
+        state.workspace_gitignore_rules = build_workspace_gitignore_rules(workspace_folders);
 
         fprintf(stderr, "[debug] crossref: converted workspace root paths count=%zu\n", state.workspace_root_paths.size());
 
@@ -414,7 +760,7 @@ class CrossrefService {
 
         fprintf(stderr, "[debug] crossref: indexed open documents count=%zu\n", open_documents_by_uri.size());
 
-        const std::vector<std::string> workspace_uris = collect_workspace_text_uris(workspace_folders);
+        const std::vector<std::string> workspace_uris = collect_workspace_text_uris(workspace_folders, state.workspace_gitignore_rules);
         fprintf(stderr, "[debug] crossref: collected %zu text files in workspace\n", workspace_uris.size());
         for (const auto& uri : workspace_uris) {
             const auto open_document_it = open_documents_by_uri.find(uri);
@@ -443,6 +789,7 @@ class CrossrefService {
         open_document_versions_ = std::move(state.open_document_versions);
         disk_file_timestamps_ = std::move(state.disk_file_timestamps);
         workspace_root_paths_ = std::move(state.workspace_root_paths);
+        workspace_gitignore_rules_ = std::move(state.workspace_gitignore_rules);
         indexed_file_paths_ = std::move(state.indexed_file_paths);
         next_line_id_ = state.next_line_id;
     }

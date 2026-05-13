@@ -1634,6 +1634,310 @@ DEFINE_TEST(test_crossref_service_skips_lines_when_exact_count_reaches_limit) {
     std::filesystem::remove_all(workspace_path);
 }
 
+DEFINE_TEST(test_crossref_service_skips_gitignored_paths_during_initial_scan) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_gitignore_workspace";
+    const auto ignored_dir_path = workspace_path / "ignored";
+    std::filesystem::create_directories(ignored_dir_path);
+
+    const auto current_file_path = workspace_path / "current.txt";
+    const auto included_file_path = workspace_path / "included.txt";
+    const auto ignored_file_path = ignored_dir_path / "ignored.txt";
+
+    {
+        std::ofstream output(workspace_path / ".gitignore", std::ios::binary);
+        output << "ignored/\n";
+    }
+    {
+        std::ofstream output(included_file_path, std::ios::binary);
+        output << white_circle << "0002T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0002T" << black_circle << "included\n";
+    }
+    {
+        std::ofstream output(ignored_file_path, std::ios::binary);
+        output << white_circle << "0003T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0003T" << black_circle << "ignored\n";
+    }
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+
+    const std::string current_uri = bridge_documents::file_uri_from_path(current_file_path);
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0001T" + black_circle + "current\n",
+        1);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-gitignore-initial-scan"};
+
+    service.update_parser_config(
+        parser_state,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["refs"].size() == 1);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["fileName"] == included_file_path.string());
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["trLine"] == "included");
+
+    std::filesystem::remove_all(workspace_path);
+}
+
+DEFINE_TEST(test_crossref_service_skips_paths_from_dltxt_ignore_during_initial_scan) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_dltxt_ignore_workspace";
+    const auto ignored_dir_path = workspace_path / "ignored";
+    const auto dltxt_dir_path = workspace_path / ".dltxt";
+    std::filesystem::create_directories(ignored_dir_path);
+    std::filesystem::create_directories(dltxt_dir_path);
+
+    const auto current_file_path = workspace_path / "current.txt";
+    const auto included_file_path = workspace_path / "included.txt";
+    const auto ignored_file_path = ignored_dir_path / "ignored.txt";
+
+    {
+        std::ofstream output(dltxt_dir_path / "ignore", std::ios::binary);
+        output << "ignored/\n";
+    }
+    {
+        std::ofstream output(included_file_path, std::ios::binary);
+        output << white_circle << "0002T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0002T" << black_circle << "included\n";
+    }
+    {
+        std::ofstream output(ignored_file_path, std::ios::binary);
+        output << white_circle << "0003T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0003T" << black_circle << "ignored\n";
+    }
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+
+    const std::string current_uri = bridge_documents::file_uri_from_path(current_file_path);
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0001T" + black_circle + "current\n",
+        1);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-dltxt-ignore-initial-scan"};
+
+    service.update_parser_config(
+        parser_state,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["refs"].size() == 1);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["fileName"] == included_file_path.string());
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["trLine"] == "included");
+
+    std::filesystem::remove_all(workspace_path);
+}
+
+DEFINE_TEST(test_crossref_service_ignores_non_text_dltxt_ignore_file) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_dltxt_ignore_binary_workspace";
+    const auto ignored_dir_path = workspace_path / "ignored";
+    const auto dltxt_dir_path = workspace_path / ".dltxt";
+    std::filesystem::create_directories(ignored_dir_path);
+    std::filesystem::create_directories(dltxt_dir_path);
+
+    const auto current_file_path = workspace_path / "current.txt";
+    const auto included_file_path = workspace_path / "included.txt";
+    const auto ignored_file_path = ignored_dir_path / "ignored.txt";
+
+    {
+        std::ofstream output(dltxt_dir_path / "ignore", std::ios::binary);
+        const char bytes[] = {'i', 'g', 'n', 'o', 'r', 'e', 'd', '/', '\0', '\n'};
+        output.write(bytes, static_cast<std::streamsize>(sizeof(bytes)));
+    }
+    {
+        std::ofstream output(included_file_path, std::ios::binary);
+        output << white_circle << "0002T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0002T" << black_circle << "included\n";
+    }
+    {
+        std::ofstream output(ignored_file_path, std::ios::binary);
+        output << white_circle << "0003T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0003T" << black_circle << "ignored\n";
+    }
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+
+    const std::string current_uri = bridge_documents::file_uri_from_path(current_file_path);
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0001T" + black_circle + "current\n",
+        1);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-dltxt-ignore-binary"};
+
+    service.update_parser_config(
+        parser_state,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["refs"].size() == 2);
+
+    bool found_included = false;
+    bool found_ignored = false;
+    for (const auto& ref : result["matches"][0]["refs"]) {
+        const std::string file_name = ref["lineInfo"]["fileName"].get<std::string>();
+        if (file_name == included_file_path.string()) {
+            found_included = true;
+        }
+        if (file_name == ignored_file_path.string()) {
+            found_ignored = true;
+        }
+    }
+    assert(found_included);
+    assert(found_ignored);
+
+    std::filesystem::remove_all(workspace_path);
+}
+
+DEFINE_TEST(test_crossref_service_skips_unicode_paths_from_dltxt_ignore_during_initial_scan) {
+    const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
+    const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
+    const bridge_text::RegexConfig config{
+        white_circle + "\\d+[TN]" + white_circle,
+        black_circle + "\\d+[TN]" + black_circle,
+        "",
+        "",
+        "",
+        "",
+        "",
+    };
+
+    const auto workspace_path = std::filesystem::temp_directory_path() / "dltxt_bridge_crossref_dltxt_ignore_unicode_workspace";
+    const auto ignored_dir_name = std::filesystem::path(bridge_documents::utf8_to_utf16("\xE5\x8E\x9F\xE6\x96\x87"));
+    const auto ignored_dir_path = workspace_path / ignored_dir_name;
+    const auto dltxt_dir_path = workspace_path / ".dltxt";
+    std::filesystem::create_directories(ignored_dir_path);
+    std::filesystem::create_directories(dltxt_dir_path);
+
+    const auto current_file_path = workspace_path / "current.txt";
+    const auto included_file_path = workspace_path / "included.txt";
+    const auto ignored_file_path = ignored_dir_path / "ignored.txt";
+
+    {
+        std::ofstream output(dltxt_dir_path / "ignore", std::ios::binary);
+        output << "\xE5\x8E\x9F\xE6\x96\x87/\n";
+    }
+    {
+        std::ofstream output(included_file_path, std::ios::binary);
+        output << white_circle << "0002T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0002T" << black_circle << "included\n";
+    }
+    {
+        std::ofstream output(ignored_file_path, std::ios::binary);
+        output << white_circle << "0003T" << white_circle << utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") << "\n"
+               << black_circle << "0003T" << black_circle << "ignored\n";
+    }
+
+    bridge_documents::DocumentManager manager;
+    manager.set_workspace_folders({bridge_documents::file_uri_from_path(workspace_path)});
+
+    const std::string current_uri = bridge_documents::file_uri_from_path(current_file_path);
+    manager.open_from_lsp(
+        current_uri,
+        white_circle + "0001T" + white_circle + utf8_bytes("\xE3\x81\x93\xE3\x82\x93\xE3\x81\xAB\xE3\x81\xA1\xE3\x81\xAF") + "\n"
+            + black_circle + "0001T" + black_circle + "current\n",
+        1);
+
+    bridge_crossref::CrossrefService service;
+    boost::asio::thread_pool pool(2);
+    const bridge_crossref::ParserState parser_state{config, "test-crossref-dltxt-ignore-unicode"};
+
+    service.update_parser_config(
+        parser_state,
+        manager.workspace_folders_snapshot(),
+        manager.open_documents_snapshot(),
+        pool);
+    pool.join();
+
+    const auto current_document = manager.document_snapshot(current_uri);
+    assert(current_document.has_value());
+    const json result = service.search_json(*current_document, 80, 10);
+
+    assert(result.contains("matches"));
+    assert(result["matches"].is_array());
+    assert(result["matches"].size() == 1);
+    assert(result["matches"][0]["refs"].size() == 1);
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["fileName"] == included_file_path.string());
+    assert(result["matches"][0]["refs"][0]["lineInfo"]["trLine"] == "included");
+
+    std::filesystem::remove_all(workspace_path);
+}
+
 DEFINE_TEST(test_standard_text_parser_extracts_japanese_pairs) {
     const std::string white_circle = utf8_bytes("\xE2\x97\x8B");
     const std::string black_circle = utf8_bytes("\xE2\x97\x8F");
