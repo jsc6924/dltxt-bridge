@@ -18,11 +18,9 @@
 #include "../bridge_app.hpp"
 #include "../bridge_crossref.hpp"
 #include "../bridge_documents.hpp"
-#include "../bridge_http_proxy.hpp"
 #include "../batch.hpp"
 #include "../bridge_local_requests.hpp"
 #include "../bridge_protocol.hpp"
-#include "../bridge_runtime.hpp"
 #include "../bridge_thread_pool.hpp"
 #include "../bridge_similarity_index.hpp"
 #include "../bridge_text_parser.hpp"
@@ -175,202 +173,6 @@ DEFINE_TEST(test_parse_bridge_settings_version_flag) {
     assert(settings.remote_port == "9000");
 }
 
-DEFINE_TEST(test_local_http_proxy_uses_fixed_port) {
-    assert(bridge_http::local_http_port == 9286);
-}
-
-DEFINE_TEST(test_extract_application_id_from_script_asset) {
-    const auto application_id = bridge_http::extract_application_id(R"(window._ApplicationId = "AbC123")");
-
-    assert(application_id.has_value());
-    assert(*application_id == "AbC123");
-}
-
-DEFINE_TEST(test_extract_preload_script_urls_resolves_relative_and_absolute_hrefs) {
-    const std::string html = R"(
-        <html>
-            <head>
-                <link rel="preload" as="script" href="/assets/app.js">
-                <link as="script" rel="preload" href="https://cdn.example.com/vendor.js">
-                <link rel="stylesheet" href="/assets/app.css">
-            </head>
-        </html>)";
-
-    const auto urls = bridge_http::extract_preload_script_urls(html, "https://www.mojidict.com/");
-
-    assert(urls.size() == 2);
-    assert(urls[0] == "https://www.mojidict.com/assets/app.js");
-    assert(urls[1] == "https://cdn.example.com/vendor.js");
-}
-
-DEFINE_TEST(test_build_search_payload_matches_expected_union_api_shape) {
-    const json payload = bridge_http::build_search_payload("bridge");
-
-    assert(payload["functions"].is_array());
-    assert(payload["functions"].size() == 1);
-    assert(payload["functions"][0]["name"] == "search-all");
-    assert(payload["functions"][0]["params"]["text"] == "bridge");
-    assert(payload["functions"][0]["params"]["types"] == json::array({102, 106}));
-}
-
-DEFINE_TEST(test_transform_details_response_shapes_words_for_local_clients) {
-    const json response = json{{"result", json{{"result", json::array({
-        json{
-            {"word", json{{"objectId", "word-1"}, {"spell", "spell-1"}, {"pron", "pron-1"}, {"accent", "1"}, {"excerpt", "to see"}}},
-            {"details", json::array({json{{"objectId", "detail-1"}, {"title", "Meaning"}}})},
-            {"subdetails", json::array({json{{"objectId", "sub-1"}, {"title", "Primary"}, {"detailsId", "detail-1"}}})},
-            {"examples", json::array({json{{"objectId", "example-1"}, {"title", "Example title"}, {"trans", "example"}, {"subdetailsId", "sub-1"}}})}
-        }
-    })}}}};
-
-    const json transformed = bridge_http::transform_details_response(response);
-
-    assert(transformed["words"].is_array());
-    assert(transformed["words"].size() == 1);
-    assert(transformed["words"][0]["id"] == "word-1");
-    assert(transformed["words"][0]["spell"] == "spell-1");
-    assert(transformed["words"][0]["details"][0]["id"] == "detail-1");
-    assert(transformed["words"][0]["subDetails"][0]["detailId"] == "detail-1");
-    assert(transformed["words"][0]["subDetails"][0]["examples"][0]["id"] == "example-1");
-}
-
-DEFINE_TEST(test_dispatch_local_request_returns_healthcheck_text) {
-    net::io_context ioc;
-    std::optional<bridge_http::LocalHttpResponse> response;
-    bool ensure_ready_called = false;
-
-    net::co_spawn(ioc,
-        [&]() -> net::awaitable<void> {
-            response = co_await bridge_http::dispatch_local_request(
-                bridge_http::http::verb::get,
-                "/healthcheck",
-                "",
-                "0.1.1",
-                [&ensure_ready_called]() -> net::awaitable<void> {
-                    ensure_ready_called = true;
-                    co_return;
-                },
-                [](std::string, json) -> net::awaitable<json> {
-                    assert(false);
-                    co_return json::object();
-                });
-            co_return;
-        },
-        net::detached);
-
-    ioc.run();
-
-    assert(response.has_value());
-    assert(!ensure_ready_called);
-    assert(response->status == bridge_http::http::status::ok);
-    assert(response->body == "version=0.1.1");
-}
-
-DEFINE_TEST(test_dispatch_local_request_proxies_search_payload_and_response) {
-    net::io_context ioc;
-    std::optional<bridge_http::LocalHttpResponse> response;
-    bool ensure_ready_called = false;
-    std::string captured_url;
-    json captured_payload;
-
-    net::co_spawn(ioc,
-        [&]() -> net::awaitable<void> {
-            response = co_await bridge_http::dispatch_local_request(
-                bridge_http::http::verb::post,
-                "/search",
-                R"({"query":"dictionary","expand":false})",
-                "0.1.1",
-                [&ensure_ready_called]() -> net::awaitable<void> {
-                    ensure_ready_called = true;
-                    co_return;
-                },
-                [&captured_url, &captured_payload](std::string url, json payload) -> net::awaitable<json> {
-                    captured_url = std::move(url);
-                    captured_payload = std::move(payload);
-                    json proxy_response;
-                    proxy_response["result"]["results"]["search-all"]["items"] = json::array({json{{"id", "entry-1"}}});
-                    co_return proxy_response;
-                });
-            co_return;
-        },
-        net::detached);
-
-    ioc.run();
-
-    assert(ensure_ready_called);
-    assert(captured_url == "https://api.mojidict.com/parse/functions/union-api");
-    assert(captured_payload == bridge_http::build_search_payload("dictionary"));
-    assert(response.has_value());
-    assert(response->status == bridge_http::http::status::ok);
-
-    const json response_json = json::parse(response->body);
-    assert(response_json["items"].is_array());
-    assert(response_json["items"][0]["id"] == "entry-1");
-}
-
-DEFINE_TEST(test_dispatch_local_request_proxies_details_and_transforms_response) {
-    net::io_context ioc;
-    std::optional<bridge_http::LocalHttpResponse> response;
-    json captured_payload;
-
-    net::co_spawn(ioc,
-        [&]() -> net::awaitable<void> {
-            response = co_await bridge_http::dispatch_local_request(
-                bridge_http::http::verb::post,
-                "/details",
-                R"({"objectIds":["word-1"]})",
-                "0.1.1",
-                []() -> net::awaitable<void> {
-                    co_return;
-                },
-                [&captured_payload](std::string, json payload) -> net::awaitable<json> {
-                    captured_payload = std::move(payload);
-                    json proxy_response = json{{"result", json{{"result", json::array({
-                        json{
-                            {"word", json{{"objectId", "word-1"}, {"spell", "bridge-spell"}}},
-                            {"details", json::array({json{{"objectId", "detail-1"}, {"title", "bridge"}}})},
-                            {"subdetails", json::array()},
-                            {"examples", json::array()}
-                        }
-                    })}}}};
-                    co_return proxy_response;
-                });
-            co_return;
-        },
-        net::detached);
-
-    ioc.run();
-
-    assert(captured_payload == bridge_http::build_details_payload({"word-1"}));
-    assert(response.has_value());
-    assert(response->status == bridge_http::http::status::ok);
-
-    const json response_json = json::parse(response->body);
-    assert(response_json["words"].size() == 1);
-    assert(response_json["words"][0]["id"] == "word-1");
-    assert(response_json["words"][0]["details"][0]["title"] == "bridge");
-}
-
-DEFINE_TEST(test_initialize_http_service_warms_up_remote_dependencies_before_requests) {
-    net::io_context ioc;
-    bool ensure_ready_called = false;
-
-    net::co_spawn(ioc,
-        [&]() -> net::awaitable<void> {
-            co_await bridge_http::initialize_http_service(
-                [&ensure_ready_called]() -> net::awaitable<void> {
-                    ensure_ready_called = true;
-                    co_return;
-                });
-            co_return;
-        },
-        net::detached);
-
-    ioc.run();
-
-    assert(ensure_ready_called);
-}
-
 DEFINE_TEST(test_parse_bridge_settings_rejects_legacy_listen_port_argument) {
     bool threw = false;
 
@@ -474,44 +276,6 @@ DEFINE_TEST(test_local_session_manager_last_disconnect_triggers_immediate_idle_t
     manager.unregister(session);
 
     assert(idle_timeout_triggered);
-}
-
-DEFINE_TEST(test_remote_notification_forwarder_broadcasts_to_local_clients) {
-    net::io_context ioc;
-    auto session_manager = std::make_shared<LocalSessionManager>();
-    auto notification_queue = std::make_shared<RemoteNotificationQueue>(ioc.get_executor());
-
-    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
-    tcp::socket client_socket(ioc);
-    client_socket.connect({net::ip::address_v4::loopback(), acceptor.local_endpoint().port()});
-
-    auto server_socket = std::make_shared<tcp::socket>(ioc);
-    acceptor.accept(*server_socket);
-    session_manager->register_session(std::make_shared<LocalSession>(server_socket));
-
-    const std::string payload = R"({"jsonrpc":"2.0","method":"simpletm/progress","params":{"project_id":"demo"}})";
-    std::optional<std::optional<std::string>> received_message;
-    beast::flat_buffer read_buffer;
-
-    net::co_spawn(ioc,
-        [&]() -> net::awaitable<void> {
-            received_message = co_await lsp::read_message(client_socket, read_buffer);
-            co_return;
-        },
-        net::detached);
-
-    notification_queue->push(payload);
-    notification_queue->close();
-
-    net::co_spawn(ioc,
-        remote_notification_forwarder(notification_queue, session_manager),
-        net::detached);
-
-    ioc.run();
-
-    assert(received_message.has_value());
-    assert(received_message->has_value());
-    assert(**received_message == payload);
 }
 
 DEFINE_TEST(test_local_session_write_framed_serializes_overlapping_writes) {
@@ -654,12 +418,14 @@ DEFINE_TEST(test_local_handler_rejects_unsupported_local_requests) {
     assert(handling.directive == bridge_local::SessionDirective::none);
 }
 
-DEFINE_TEST(test_local_handler_forwards_simpletm_requests) {
+DEFINE_TEST(test_local_handler_rejects_simpletm_requests) {
     const json request = json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "simpletm/complete"}};
     const auto handling = bridge_local::handle_request(nullptr, request);
 
-    assert(handling.forward_to_remote);
-    assert(!handling.response.has_value());
+    assert(!handling.forward_to_remote);
+    assert(handling.response.has_value());
+    assert((*handling.response)["error"]["code"] == -32601);
+    assert((*handling.response)["error"]["message"] == "method simpletm/complete is not recognized");
 }
 
 DEFINE_TEST(test_local_handler_swallows_non_simpletm_notifications) {
@@ -2613,148 +2379,6 @@ DEFINE_TEST(test_standard_text_parser_parses_regex_with_extra_user_captures) {
     assert(pairs.size() == 1);
     assert(bridge_documents::utf16_to_utf8(pairs[0].original.text) == jp_hello);
     assert(bridge_documents::utf16_to_utf8(pairs[0].translated.text) == zh_hello);
-}
-
-struct FakeRemote {
-    int id = -1;
-};
-
-DEFINE_TEST(test_remote_retry_loop_retries_with_fresh_remote_instances) {
-    net::io_context ioc;
-    auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
-    std::vector<std::shared_ptr<FakeRemote>> created_remotes;
-    std::vector<int> attempted_ids;
-    int error_count = 0;
-
-    net::co_spawn(ioc,
-        run_remote_retry_loop(
-            active_remote,
-            [&created_remotes](boost::asio::any_io_executor) {
-                auto remote = std::make_shared<FakeRemote>();
-                remote->id = static_cast<int>(created_remotes.size());
-                created_remotes.push_back(remote);
-                return remote;
-            },
-            [&attempted_ids, active_remote](const std::shared_ptr<FakeRemote>& remote) -> net::awaitable<void> {
-                assert(active_remote->get() == remote);
-                attempted_ids.push_back(remote->id);
-
-                if (remote->id == 0) {
-                    throw std::runtime_error("disconnect");
-                }
-
-                co_return;
-            },
-            [&error_count](std::exception_ptr error) {
-                ++error_count;
-
-                try {
-                    if (error) {
-                        std::rethrow_exception(error);
-                    }
-                } catch (const std::runtime_error& e) {
-                    assert(std::string(e.what()) == "disconnect");
-                } catch (...) {
-                    assert(false);
-                }
-            },
-            2),
-        net::detached);
-
-    ioc.run();
-
-    assert(created_remotes.size() == 2);
-    assert(created_remotes[0] != created_remotes[1]);
-    assert(attempted_ids.size() == 2);
-    assert(attempted_ids[0] == 0);
-    assert(attempted_ids[1] == 1);
-    assert(error_count == 1);
-    assert(!active_remote->get());
-}
-
-DEFINE_TEST(test_remote_retry_loop_cancels_pending_responses_after_disconnect) {
-    net::io_context ioc;
-    auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
-    auto response_manager = std::make_shared<ResponseManager>();
-    const RequestId id = std::string{"req-disconnect"};
-
-    std::optional<ResponseManager::WaitResult> result;
-    int error_count = 0;
-
-    const RequestId bridge_id = response_manager->create_bridge_request_id(id, ioc.get_executor());
-
-    net::co_spawn(ioc,
-        [response_manager, &result, bridge_id]() -> net::awaitable<void> {
-            result = co_await response_manager->wait_for_response(bridge_id);
-            co_return;
-        },
-        net::detached);
-
-    net::co_spawn(ioc,
-        run_remote_retry_loop(
-            active_remote,
-            [](boost::asio::any_io_executor) {
-                return std::make_shared<FakeRemote>();
-            },
-            [response_manager](const std::shared_ptr<FakeRemote>&) -> net::awaitable<void> {
-                response_manager->cancel_all();
-                throw std::runtime_error("disconnect");
-            },
-            [&error_count](std::exception_ptr error) {
-                ++error_count;
-
-                try {
-                    if (error) {
-                        std::rethrow_exception(error);
-                    }
-                } catch (const std::runtime_error& e) {
-                    assert(std::string(e.what()) == "disconnect");
-                } catch (...) {
-                    assert(false);
-                }
-            },
-            1),
-        net::detached);
-
-    ioc.run();
-
-    assert(error_count == 1);
-    assert(result.has_value());
-    assert(result->status == ResponseManager::WaitStatus::cancelled);
-    assert(!active_remote->get());
-}
-
-DEFINE_TEST(test_remote_retry_loop_applies_backoff_after_failure) {
-    using namespace std::chrono_literals;
-
-    net::io_context ioc;
-    auto active_remote = std::make_shared<ActiveRemote<FakeRemote>>();
-    std::vector<std::chrono::steady_clock::time_point> attempt_times;
-
-    net::co_spawn(ioc,
-        run_remote_retry_loop(
-            active_remote,
-            [](boost::asio::any_io_executor) {
-                return std::make_shared<FakeRemote>();
-            },
-            [&attempt_times](const std::shared_ptr<FakeRemote>&) -> net::awaitable<void> {
-                attempt_times.push_back(std::chrono::steady_clock::now());
-                if (attempt_times.size() == 1) {
-                    throw std::runtime_error("disconnect");
-                }
-
-                co_return;
-            },
-            [](std::exception_ptr) {},
-            2,
-            20ms,
-            40ms),
-        net::detached);
-
-    ioc.run();
-
-    assert(attempt_times.size() == 2);
-    assert((attempt_times[1] - attempt_times[0]) >= 15ms);
 }
 
 const std::vector<NamedTest>& all_tests() {

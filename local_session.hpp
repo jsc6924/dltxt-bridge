@@ -6,7 +6,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -181,7 +180,6 @@ class LocalSession {
     net::strand<net::any_io_executor> strand_;
     std::deque<std::string> write_queue_;
     bool write_in_progress_ = false;
-    std::set<std::string> subscribed_projects_;
     mutable std::mutex state_mutex_;
     bool client_initialized_ = false;
     bool pending_crossref_index_ready_ = false;
@@ -256,18 +254,6 @@ public:
         }
 
         write_in_progress_ = false;
-    }
-
-    void register_subscription(const std::string& project_id) {
-        subscribed_projects_.insert(project_id);
-    }
-
-    bool is_subscribed_to(const std::string& project_id) const {
-        return subscribed_projects_.find(project_id) != subscribed_projects_.end();
-    }
-
-    void unregister_subscription(const std::string& project_id) {
-        subscribed_projects_.erase(project_id);
     }
 
     bool request_crossref_index_ready_delivery() {

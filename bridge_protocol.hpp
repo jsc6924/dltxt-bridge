@@ -453,17 +453,6 @@ struct RequestResult {
     }
 };
 
-struct SubscribeParam {
-    std::string project_id;
-    static std::optional<SubscribeParam> from_json(const json& params) {
-        if (!params.is_object() || !params.contains("project_id") || !params["project_id"].is_string()) {
-            return std::nullopt;
-        }
-
-        return SubscribeParam{params["project_id"].get<std::string>()};
-    }
-};
-
 inline std::vector<std::string> workspace_folders_from_initialize_params(const json& params) {
     std::vector<std::string> folders;
 
@@ -569,19 +558,6 @@ inline RequestResult handle_request(std::shared_ptr<LocalSession> session, const
 
     const std::string method = request["method"].get<std::string>();
     const json params = request.value("params", json::object());
-    if (method.rfind("simpletm/", 0) == 0) {
-        if (method == "simpletm/subscribeProject") {
-            const auto subscribe_params = SubscribeParam::from_json(params);
-            if (!subscribe_params.has_value()) {
-                return RequestResult::error_response(request.value("id", nullptr), -32602, "Invalid params");
-            }
-
-            session->register_subscription(subscribe_params->project_id);
-            lsp::log_local_request(method, params);
-        }
-        return RequestResult::forward();
-    }
-
     if (method == "textDocument/didOpen") {
         if (context != nullptr && context->document_manager) {
             const json text_document = params.value("textDocument", json::object());

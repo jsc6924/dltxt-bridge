@@ -17,8 +17,6 @@ endif()
 # Find dependencies via vcpkg
 find_package(Boost REQUIRED COMPONENTS system regex)
 find_package(nlohmann_json CONFIG REQUIRED)
-set(OPENSSL_USE_STATIC_LIBS TRUE)
-find_package(OpenSSL REQUIRED)
 find_path(UCHARDET_INCLUDE_DIR NAMES uchardet/uchardet.h uchardet.h)
 find_library(UCHARDET_LIBRARY NAMES uchardet libuchardet)
 
@@ -31,7 +29,7 @@ enable_testing()
 configure_file(bridge_version.hpp.in bridge_version.hpp @ONLY)
 
 add_executable(dltxt_bridge main.cpp)
-set_target_properties(dltxt_bridge PROPERTIES OUTPUT_NAME dltxt_bridge_v3)
+set_target_properties(dltxt_bridge PROPERTIES OUTPUT_NAME dltxt_lsp_server)
 target_include_directories(dltxt_bridge PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${UCHARDET_INCLUDE_DIR})
 add_custom_command(TARGET dltxt_bridge POST_BUILD
   COMMAND ${CMAKE_COMMAND}
@@ -45,7 +43,6 @@ target_include_directories(dltxt_bridge_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg.json
-  ${CMAKE_CURRENT_SOURCE_DIR}/bridge_http_proxy.hpp
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_tests.cpp
 )
 
@@ -54,8 +51,6 @@ target_link_libraries(dltxt_bridge PRIVATE
     Boost::system
   Boost::regex
     nlohmann_json::nlohmann_json
-    OpenSSL::SSL
-    OpenSSL::Crypto
     ${UCHARDET_LIBRARY}
 )
 
@@ -64,8 +59,6 @@ target_link_libraries(dltxt_bridge_tests PRIVATE
   Boost::system
   Boost::regex
   nlohmann_json::nlohmann_json
-  OpenSSL::SSL
-  OpenSSL::Crypto
   ${UCHARDET_LIBRARY}
 )
 
